@@ -40,6 +40,7 @@ CATEGORY_OWNER: dict[str, str] = {
     "Соленья": "Разнорабочий",
     "Зелень": "Разнорабочий",
     "Мясо и рыба": "Повар",
+    "Грибы": "Повар",
     "Бакалея": "Повар",
     "Молочка": "Повар",
     "Хлеб и холодильник": "Разнорабочий",
@@ -148,6 +149,29 @@ class MenuLine:
 
 
 @dataclass(frozen=True, slots=True)
+class PlanLine:
+    """Строка недельного плана меню — блюдо, закреплённое за днём недели.
+
+    План отвечает на вопрос «что готовим на неделе», а «Конструктор меню» —
+    на вопрос «что готовим сегодня». Строка плана разворачивается в строку
+    конструктора, когда шеф запускает сборку с ключом --week.
+    """
+
+    weekday: str
+    """Понедельник … Пятница."""
+
+    meal: str
+    """Завтрак / Обед / Ужин."""
+
+    recipe: str
+    """Название блюда из ТТК."""
+
+    portions: int
+    serve_at: time
+    note: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class TaskTemplate:
     """Типовая операция из листа «Задачи».
 
@@ -234,6 +258,8 @@ class KitchenData:
     recipes: dict[str, Recipe] = field(default_factory=dict)
     tasks: tuple[TaskTemplate, ...] = ()
     menu: tuple[MenuLine, ...] = ()
+    plan: tuple[PlanLine, ...] = ()
+    """Недельный план меню — из него берётся день смены."""
     writeoffs: tuple[StockLine, ...] = ()
     inventory: tuple[InventoryLine, ...] = ()
     assumptions: tuple[Assumption, ...] = ()

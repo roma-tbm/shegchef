@@ -60,14 +60,6 @@ class TaskBoard:
 
     by_meal: dict[str, tuple[Task, ...]] = field(default_factory=dict)
 
-    def missing_recipes(self, recipes: dict[str, Recipe]) -> tuple[str, ...]:
-        """Блюда в меню, для которых не заведено ни одной операции."""
-        return tuple(
-            name
-            for name, r in recipes.items()
-            if r.in_menu and name not in self.chains and not r.ingredients
-        )
-
 
 def _keywords(operation: str) -> tuple[str, ...]:
     """Резервный подбор продуктов, если колонка «Продукты» не заполнена."""

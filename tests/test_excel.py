@@ -15,7 +15,7 @@ import pytest
 from openpyxl import Workbook, load_workbook
 
 from kitchen.core import build_shift_sheet
-from kitchen.excel import build_workbook, read_menu
+from kitchen.excel import build_workbook, iter_blocks, read_menu
 from kitchen.models import MenuLine
 from kitchen.seed import demo_data
 
@@ -30,10 +30,12 @@ SHEETS = [
     "ТТК",
     "Ингредиенты",
     "Конструктор меню",
+    "План меню",
     "Задачи",
     "Списания",
     "Инвентаризация",
     "Инструкция",
+    "Справочник блюд",
 ]
 
 
@@ -53,24 +55,30 @@ def rewrite_menu(path: Path, *, portions: int | None = None, drop: str = "") -> 
     """Правка листа «Конструктор меню» руками, как это делает пользователь."""
     wb = load_workbook(path)
     ws = wb["Конструктор меню"]
-    header_row, cols = _header(ws)
-    for row in range(header_row + 1, ws.max_row + 1):
-        name = ws.cell(row=row, column=cols["Блюдо"]).value
-        if not name:
+    for block in iter_blocks(ws):
+        if block.dish is None or block.portions is None:
             continue
-        if name == drop:
-            ws.cell(row=row, column=cols["Порций"], value=0)
-        elif portions is not None:
-            ws.cell(row=row, column=cols["Порций"], value=portions)
+        for row in range(block.first, block.last + 1):
+            name = ws.cell(row=row, column=block.dish).value
+            if not name:
+                continue
+            if name == drop:
+                ws.cell(row=row, column=block.portions, value=0)
+            elif portions is not None:
+                ws.cell(row=row, column=block.portions, value=portions)
     wb.save(path)
 
 
-def _header(ws) -> tuple[int, dict[str, int]]:
-    for row in ws.iter_rows(min_row=1, max_row=30):
-        labels = [str(c.value).strip() if c.value else "" for c in row]
-        if "Блюдо" in labels and "Порций" in labels:
-            return row[0].row, {n: labels.index(n) + 1 for n in labels if n}
-    raise AssertionError("заголовок листа «Конструктор меню» не найден")
+def free_slot(path: Path, meal: str) -> int:
+    """Первая пустая строка окна приёма пищи — куда шеф ставит блюдо."""
+    ws = load_workbook(path)["Конструктор меню"]
+    for block in iter_blocks(ws):
+        if block.meal != meal or block.dish is None:
+            continue
+        for row in range(block.first, block.last + 1):
+            if not ws.cell(row=row, column=block.dish).value:
+                return row
+    raise AssertionError(f"в окне «{meal}» нет свободных строк")
 
 
 def recompute(path: Path) -> object:
@@ -127,10 +135,10 @@ def test_одна_строка_меню_не_ломает_остальные(boo
     """Опечатка в одной строке не должна ронять весь расчёт."""
     wb = load_workbook(book_path)
     ws = wb["Конструктор меню"]
-    header_row, cols = _header(ws)
-    bogus = ws.max_row + 1
-    ws.cell(row=bogus, column=cols["Блюдо"], value="Борщ украинский")
-    ws.cell(row=bogus, column=cols["Порций"], value=30)
+    row = free_slot(book_path, "Обед")
+    block = next(b for b in iter_blocks(ws) if b.dish is not None and row in range(b.first, b.last + 1))
+    ws.cell(row=row, column=block.dish, value="Борщ украинский")
+    ws.cell(row=row, column=block.portions, value=30)
     wb.save(book_path)
 
     sheet = recompute(book_path)
@@ -171,14 +179,21 @@ def test_файл_перезаписывается_без_ошибок(tmp_path:
     assert load_workbook(path).sheetnames == SHEETS
 
 
-def test_файл_не_содержит_формул(book_path: Path):
-    """Расчёт полностью на Python: в книге не должно быть битых формул."""
+def test_расчёт_не_сделан_формулами(book_path: Path):
+    """Расчёт полностью на Python: битых формул в книге быть не должно.
+
+    Исключение одно — счётчики панели поиска в «Конструкторе меню». Они
+    считают совпадения запроса с ТТК и ничего не рассчитывают; без них поиск
+    не работал бы без запуска скрипта.
+    """
     wb = load_workbook(book_path)
     for ws in wb.worksheets:
         for row in ws.iter_rows():
             for cell in row:
-                if isinstance(cell.value, str):
-                    assert not cell.value.startswith("="), f"{ws.title}!{cell.coordinate}"
+                if not isinstance(cell.value, str) or not cell.value.startswith("="):
+                    continue
+                assert ws.title == "Конструктор меню", f"{ws.title}!{cell.coordinate}"
+                assert cell.value.startswith(("=COUNTIF",)), cell.value
 
 
 def test_лист_сцены_разбит_на_блоки_по_ролям(book_path: Path):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.worksheet import Worksheet
 
 INK = "1F2933"
@@ -18,16 +19,25 @@ DANGER_FG = "A5320F"
 OK_FG = "1F6F5C"
 BAND = "F5F7F9"
 ZEBRA = "FAFBFC"
+SUBBAR_BG = "EDF1F5"
+LINK_FG = "1A5FB4"
+INPUT_BG = "FFFDF3"
 
 THIN = Side(style="thin", color=LINE)
+
+TIME_FMT = "HH:MM"
+NUM_FMT = "#,##0.00"
 
 TITLE = Font(name="Calibri", size=16, bold=True, color=HEAD)
 SUBTITLE = Font(name="Calibri", size=10, color=MUTED)
 SECTION = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
 HEADFONT = Font(name="Calibri", size=10, bold=True, color=HEAD)
+SUBHEAD = Font(name="Calibri", size=10, bold=True, color=HEAD)
 BODY = Font(name="Calibri", size=10, color=INK)
 BOLD = Font(name="Calibri", size=10, bold=True, color=INK)
 SMALL = Font(name="Calibri", size=9, color=MUTED)
+LINK = Font(name="Calibri", size=10, color=LINK_FG, underline="single")
+LINK_SMALL = Font(name="Calibri", size=9, color=LINK_FG, underline="single")
 
 WRAP = Alignment(wrap_text=True, vertical="top")
 TOP = Alignment(vertical="top")
@@ -60,7 +70,43 @@ def section_bar(ws: Worksheet, row: int, title: str, span: int) -> int:
     return row + 1
 
 
-def table_header(ws: Worksheet, row: int, headers: tuple[str, ...]) -> int:
+def sub_bar(ws: Worksheet, row: int, title: str, span: int, indent: int = 1) -> int:
+    """Заголовок подпапки: тот же тон, но светлее — чтобы читалась вложенность."""
+    cell = ws.cell(row=row, column=1, value=title)
+    cell.font = SUBHEAD
+    cell.alignment = Alignment(vertical="center", indent=indent)
+    ws.row_dimensions[row].height = 18
+    for col in range(1, span + 1):
+        c = ws.cell(row=row, column=col)
+        c.fill = PatternFill("solid", fgColor=SUBBAR_BG)
+        c.border = Border(bottom=Side(style="thin", color=HEAD))
+    return row + 1
+
+
+def fold(ws: Worksheet, row: int, level: int) -> None:
+    """Помечает строку как сворачиваемую часть группы.
+
+    Уровень 1 — подпапка, уровень 2 — блюда внутри неё. Кнопки «−/＋»
+    появляются в левом поле, и папка складывается целиком, как в проводнике.
+    """
+    ws.row_dimensions[row].outlineLevel = level
+
+
+def fold_rows(ws: Worksheet, row: int, last: int, level: int = 1) -> None:
+    """Сворачивает блок строк целиком — например, окно приёма пищи."""
+    for r in range(row, last):
+        ws.row_dimensions[r].outlineLevel = level
+
+
+def folding(ws: Worksheet) -> None:
+    """Включает группировку строк: кнопка группировки слева от заголовков."""
+    ws.sheet_properties.outlinePr.summaryBelow = False
+    ws.sheet_view.showOutlineSymbols = True
+
+
+
+def table_header(ws: Worksheet, row: int, headers: tuple[str, ...],
+                 *, freeze: bool = True) -> int:
     for i, name in enumerate(headers, start=1):
         cell = ws.cell(row=row, column=i, value=name)
         cell.font = HEADFONT
@@ -68,7 +114,8 @@ def table_header(ws: Worksheet, row: int, headers: tuple[str, ...]) -> int:
         cell.alignment = HEADALIGN
         cell.border = Border(bottom=Side(style="medium", color=HEAD))
     ws.row_dimensions[row].height = 28
-    ws.freeze_panes = ws.cell(row=row + 1, column=1)
+    if freeze:
+        ws.freeze_panes = ws.cell(row=row + 1, column=1)
     return row + 1
 
 
@@ -122,6 +169,45 @@ def print_setup(ws: Worksheet, *, landscape: bool = True, fit_width: int = 1) ->
     ws.page_margins.right = 0.4
     ws.page_margins.top = 0.5
     ws.page_margins.bottom = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Внутренние ссылки между листами
+# ---------------------------------------------------------------------------
+
+
+def ref(sheet: str, coordinate: str) -> str:
+    """Адрес для location: имена листов с пробелами берутся в кавычки."""
+    return f"'{sheet}'!{coordinate}"
+
+
+def anchor(ws: Worksheet, row: int, column: int, coordinate: str, *, font: Font = LINK) -> None:
+    """Превращает уже заполненную ячейку в ссылку на другой лист."""
+    cell = ws.cell(row=row, column=column)
+    cell.hyperlink = Hyperlink(
+        ref=cell.coordinate,
+        location=coordinate,
+        display=str(cell.value) if cell.value is not None else None,
+    )
+    cell.font = font
+
+
+def anchors(
+    ws: Worksheet,
+    row: int,
+    column: int,
+    cells: dict[str, int],
+    sheet: str,
+    column_letter: str = "B",
+    *,
+    font: Font = LINK,
+) -> None:
+    """Вешает ссылки сразу на весь блок строк по словарю имя → строка."""
+    for i in range(row, row + len(cells)):
+        name = ws.cell(row=i, column=column).value
+        target = cells.get(str(name)) if name else None
+        if target:
+            anchor(ws, i, column, ref(sheet, f"{column_letter}{target}"), font=font)
 
 
 def fit_columns(ws: Worksheet, min_width: int = 8, max_width: int = 62) -> None:

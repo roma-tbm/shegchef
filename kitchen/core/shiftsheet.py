@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 
 from kitchen.core.ingredients import NeedGroup, ProductNeed, calculate_ingredients
-from kitchen.core.tasks import generate_tasks
+from kitchen.core.tasks import TaskBoard, generate_tasks
 from kitchen.core.timing import RoleLoad, Timing, calculate_backward_timing
 from kitchen.models import ROLES, KitchenData, MenuLine, Product, Recipe, TaskTemplate
 
@@ -181,7 +181,7 @@ def build_shift_sheet(data: KitchenData) -> ShiftSheet:
         for st in timing.control_points()
     )
 
-    warnings = _warnings(timing, needs)
+    warnings = _warnings(timing, needs, _without_tasks(menu, board))
     notes = (
         f"Смена {timing.shift_start:%H:%M}–{timing.shift_end:%H:%M} · "
         f"порций: {sum(r.portions for r in menu_rows)}",
@@ -212,8 +212,33 @@ def build_shift_sheet(data: KitchenData) -> ShiftSheet:
     )
 
 
-def _warnings(timing: Timing, needs: tuple[ProductNeed, ...]) -> tuple[str, ...]:
+def _without_tasks(
+    menu: tuple[MenuLine, ...], board: TaskBoard
+) -> tuple[str, ...]:
+    """Блюда в меню, для которых не нашлось ни одной операции.
+
+    Проверка по самому меню, а не по флагу карточки: блюдо в каталоге и
+    блюдо в сегодняшней смене — разные вещи, а сдвигать смену молча нельзя.
+    """
+    return tuple(
+        line.recipe for line in menu if line.recipe not in board.chains
+    )
+
+
+def _warnings(
+    timing: Timing,
+    needs: tuple[ProductNeed, ...],
+    without_tasks: tuple[str, ...] = (),
+) -> tuple[str, ...]:
     out: list[str] = []
+
+    if without_tasks:
+        out.append(
+            "Нет ни одной операции на: "
+            + ", ".join(f"«{n}»" for n in without_tasks)
+            + " — блюдо попадёт в продукты, но не в задачи. Добавьте строки "
+            "в «Задачи»."
+        )
 
     for recipe in timing.overruns:
         out.append(

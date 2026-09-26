@@ -3,12 +3,22 @@
 Все нормы получены делением aggregates из input1.md на 50 порций,
 поэтому продуктовая матрица в конце сходится с исходным примером
 до грамма. Замените эти цифры на свои — логика пересчитается сама.
+
+Меню смены остаётся демонстрационным, а каталог — полный: сюда добавлены
+карточки и продукты недельного меню Пн–Пт из kitchen/menu_week.py,
+поэтому в выпадающем списке «Конструктор меню» доступны все 29 блюд.
 """
 
 from __future__ import annotations
 
 from datetime import date, time
 
+from kitchen.menu_week import (
+    WEEK_PLAN,
+    WEEK_PRODUCTS,
+    WEEK_RECIPES,
+    WEEK_TASKS,
+)
 from kitchen.models import (
     Assumption,
     Ingredient,
@@ -283,9 +293,19 @@ TASKS: tuple[TaskTemplate, ...] = (
 #: шефу не нужно заново вводить её для каждого блюда.
 SCOPE_ALL = "*"
 
+#: Полный каталог: демо-блюда из input1.md плюс 24 карточки недельного меню.
+#: PRODUCTS / RECIPES / TASKS выше остаются нетронутыми — на них завязан
+#: эталонный тест, поэтому менять их можно только вместе с input1.md.
+CATALOG_PRODUCTS: tuple[Product, ...] = PRODUCTS + WEEK_PRODUCTS
+CATALOG_RECIPES: dict[str, Recipe] = {
+    **RECIPES,
+    **{r.name: r for r in WEEK_RECIPES},
+}
+CATALOG_TASKS: tuple[TaskTemplate, ...] = TASKS + WEEK_TASKS
+
 
 def demo_data(day: date | None = None) -> KitchenData:
-    """Демо-комплект на 50 порций из input1.md."""
+    """Демо-комплект на 50 порций из input1.md с полным каталогом блюд."""
     day = day or date.today()
     menu = (
         MenuLine("Каша овсяная с солёным арахисом", PORTIONS, time(8, 0), "Завтрак", day),
@@ -298,10 +318,11 @@ def demo_data(day: date | None = None) -> KitchenData:
         ),
     )
     return KitchenData(
-        products={p.name: p for p in PRODUCTS},
-        recipes=dict(RECIPES),
-        tasks=TASKS,
+        products={p.name: p for p in CATALOG_PRODUCTS},
+        recipes=dict(CATALOG_RECIPES),
+        tasks=CATALOG_TASKS,
         menu=menu,
+        plan=WEEK_PLAN,
         assumptions=ASSUMPTIONS,
         kitchen="Кухня",
         shift="Дневная смена",
@@ -352,5 +373,19 @@ ASSUMPTIONS: tuple[Assumption, ...] = (
         "Колонки «Остаток» и «Мин. запас» в листе «Продукты» заполнены "
         "демо-числами. Замените на фактические — блок «Хватает / "
         "Не хватает» пересчитается.",
+    ),
+    Assumption(
+        "Нормы недельного меню",
+        "24 блюда из меню Пн–Пт (kitchen/menu_week.py) описаны типовыми "
+        "нормами на порцию, а не рецептом конкретного шефа. Это заготовка: "
+        "правьте «Ингредиенты» под свой продукт — расчёт подстроится сам.",
+    ),
+    Assumption(
+        "План недели",
+        "Лист «План меню» — источник для ключа запуска --week. День недели "
+        "разворачивается в строки «Конструктор меню», дальше считается "
+        "как обычно. Три позиции (овсяная каша, тост, салат из квашеной "
+        "капусты) ссылаются на карточки, которые уже были в ТТК, — дубли "
+        "не заводились.",
     ),
 )
