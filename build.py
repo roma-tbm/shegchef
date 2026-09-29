@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from kitchen.excel import PLAN_SHEET, build_workbook, picker, plan_for, read_men
 from kitchen.menu_week import WEEK_PLAN
 from kitchen.models import KitchenData, MenuLine, PlanLine
 from kitchen.seed import demo_data
+from kitchen.web.scaling import ScaleError, scale_menu
 
 DEFAULT_OUT = Path("Кухня_конструктор.xlsx")
 
@@ -38,6 +40,34 @@ DEFAULT_OUT = Path("Кухня_конструктор.xlsx")
 def _known_recipes() -> dict:
     """Блюда, которые вообще можно поставить в меню."""
     return demo_data().recipes
+
+
+def _parse_scale(value: str) -> float:
+    """Проверка --scale: коэффициент строго больше нуля, иначе понятная ошибка."""
+    try:
+        factor = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"«{value}» — не число. Ожидается, например: --scale 1.3"
+        ) from None
+    if not math.isfinite(factor) or factor <= 0:
+        raise argparse.ArgumentTypeError(
+            "коэффициент должен быть больше нуля (например 1.3 или 0.8)"
+        )
+    return factor
+
+
+def _apply_scale(data: KitchenData, factor: float) -> KitchenData:
+    """Масштабирует порции выбранного источника меню.
+
+    Вызывается после чтения меню/плана и до build_shift_sheet() — то есть
+    весь дальнейший расчёт идёт существующим ядром по новым порциям.
+    """
+    try:
+        menu = scale_menu(data.menu, factor)
+    except ScaleError as exc:
+        raise ValueError(str(exc)) from exc
+    return _rebuilt(data, menu)
 
 
 def _reopen(path: Path) -> None:
@@ -188,6 +218,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="подставить блюда из ТТК в пустые строки окон "
                              "«Конструктора меню». Без значения берётся запрос из "
                              "окна поиска самой книги")
+    parser.add_argument("--scale", type=_parse_scale, default=1.0, metavar="КОЭФ",
+                        help="единый коэффициент масштабирования порций "
+                             "(например 1.3). Применяется к выбранному меню перед "
+                             "расчётом смены; округление порций до целых, минимум 1")
     parser.add_argument("--no-open", action="store_true",
                         help="не открывать результат")
     args = parser.parse_args(argv)
@@ -227,6 +261,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         report = None
 
+    if args.scale != 1.0:
+        try:
+            data = _apply_scale(data, args.scale)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     if not data.menu:
         print("Меню пустое: заполните лист «Конструктор меню».", file=sys.stderr)
         return 1
@@ -247,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"Меню: {len(data.menu)} строк ({source}), дата {day:%d.%m.%Y}")
+    if args.scale != 1.0:
+        print(f"Масштаб: {args.scale:g} × — порции округлены до целых, минимум 1")
     if report is not None:
         print(str(report))
         if report.query:
