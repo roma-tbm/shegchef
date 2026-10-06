@@ -26,12 +26,22 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from kitchen import calendar_rules
 from kitchen.core import build_shift_sheet
+from kitchen.core.deviations import DEVIATION_LABELS
+from kitchen.core.planner import STATUSES
+from kitchen.duties import duties_for
 from kitchen.excel import build_workbook
 from kitchen.menu_week import WEEK_PLAN, WEEKDAYS
 from kitchen.models import MenuLine, PlanLine, Recipe
 from kitchen.seed import demo_data
-from kitchen.web import menu_store
+from kitchen.web import (
+    deviation_store,
+    menu_store,
+    report_store,
+    settings_store,
+    status_store,
+)
 from kitchen.web.catalog import (
     MEAL_ORDER,
     default_serve_at,
@@ -46,7 +56,25 @@ from kitchen.web.menu_store import (
     save_days,
 )
 from kitchen.web.messages import all_messages_text, messages_by_role
+from kitchen.web.report_store import SaturdayReport, SemifinishedMarking, SemifinishedOutput
 from kitchen.web.scaling import ScaleError, scaled_preview, validate_factor
+from kitchen.web.settings_store import (
+    duty_settings_from,
+    load_day_inputs,
+    save_day_inputs,
+    save_settings,
+    staff_settings_from,
+)
+from kitchen.web.shift_plan import (
+    build_scenario,
+    gaps_text,
+    general_plan_form,
+    next_day_menu,
+    prep_target_day,
+    route_form,
+    routes_by_form,
+    saturday_report_form,
+)
 
 COL_DISH = "Блюдо"
 COL_MEAL = "Приём"
@@ -54,7 +82,55 @@ COL_PORT = "Порций"
 COL_SERVE = "Выдача"
 COL_REMOVE = "Убрать"
 
-TABS = ("Меню", "Расчёт смены", "Продукты и дефицит", "Задачи по ролям", "Экспорт")
+#: Отклонение в форме выбирается вместе с пустым вариантом «не было».
+NO_DEVIATION = (deviation_store.NO_DEVIATION_KIND, "— не было —")
+
+#: Подписи полей численности — те же значения, что принимает расчёт.
+_COUNT_LABELS = {
+    "chefs": "Шефы",
+    "cooks": "Повара",
+    "helper": "Разнорабочие",
+    "cleaners": "Уборщики",
+}
+_WEEKEND_LABELS = {"saturday": "Суббота", "sunday": "Воскресенье"}
+
+#: Виджеты форм, значения которых относятся к выбранной рабочей дате.
+#: Streamlit хранит значение виджета по ключу и игнорирует новый `value=` при
+#: следующей отрисовке, поэтому при смене дня их нужно сбросить вручную — иначе
+#: форма показывала бы значения прежнего дня и сохранила бы их за новый.
+_DAY_WIDGET_PREFIXES = (
+    "duration_",
+    "window_",
+    "count_",
+    "staff_",
+    "weekend_",
+    "consumption_",
+    "output_",
+    "marking_",
+    "made_",
+    "expires_",
+    "copy_text_",
+)
+_DAY_WIDGET_KEYS = (
+    "tasting_executor",
+    "disabled_duties",
+    "settings_shared",
+    "new_staff_name",
+    "new_staff_row",
+    "notes_editor",
+)
+
+TABS = (
+    "Меню",
+    "Расчёт смены",
+    "Продукты и дефицит",
+    "Задачи по ролям",
+    "Маршруты",
+    "Экспорт",
+    "Настройки смены",
+    "Отклонения",
+    "Отчёт за субботу",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +187,19 @@ def data_for(menu: list[MenuLine]) -> object:
     return replace(demo_data(st.session_state.day), menu=tuple(menu))
 
 
-def compute_sheet(menu: list[MenuLine]) -> tuple[object | None, str | None]:
-    """Расчёт смены существующим ядром. Возвращает (смена, ошибка)."""
+def compute_sheet(
+    menu: list[MenuLine], plan: object | None = None
+) -> tuple[object | None, str | None]:
+    """Расчёт смены существующим ядром. Возвращает (смена, ошибка).
+
+    Если передан авторитетный `plan`, книга берёт расписание и причины
+    неготовности из него, а не пересчитывает своё — иначе старые вкладки
+    показывали бы другую смену, чем маршруты и общий план (AC12).
+    """
     if not menu:
         return None, "Меню пустое: добавьте блюда во вкладке «Меню»."
     try:
-        return build_shift_sheet(data_for(menu)), None
+        return build_shift_sheet(data_for(menu), plan=plan), None
     except KeyError as exc:
         return None, (
             f"Неизвестное блюдо в меню: {exc}. Выберите блюдо из каталога ТТК "
@@ -132,6 +215,99 @@ def persist_store() -> None:
         {st.session_state.day.isoformat(): tuple(sort_menu(st.session_state.menu))},
         st.session_state.store,
     )
+
+
+def status_path() -> Path:
+    """Файл статусов рядом с меню пользователя."""
+    return status_store.default_status_path_for(st.session_state.store)
+
+
+def settings_path() -> Path:
+    """Файл настроек смены рядом с меню пользователя."""
+    return settings_store.default_settings_path(st.session_state.store)
+
+
+def notes_path() -> Path:
+    """Файл отклонений и комментариев рядом с меню пользователя."""
+    return deviation_store.default_notes_path(st.session_state.store)
+
+
+def report_path() -> Path:
+    """Файл отчётов рядом с меню пользователя."""
+    return report_store.default_report_path(st.session_state.store)
+
+
+def saved_report() -> SaturdayReport | None:
+    """Сохранённый субботний отчёт пользователя, если он уже заполнен (AC09)."""
+    return report_store.load_report(st.session_state.day, report_path())
+
+
+def day_inputs() -> dict:
+    """Настройки текущего дня: свои значения плюс общие как основа."""
+    return load_day_inputs(st.session_state.day, settings_path())
+
+
+def has_saved_settings() -> bool:
+    """Сохранял ли человек настройки хоть раз.
+
+    Пока настройки не сохранены, действуют значения по умолчанию: приложение
+    обязано показать план сразу, а не пустые маршруты. После первого
+    сохранения работают только введённые значения, включая нули.
+    """
+    return settings_path().exists()
+
+
+def stored_menu(day: date) -> list[MenuLine]:
+    """Меню даты из пользовательского хранилища, без подстановки заготовки.
+
+    Подготовка следующего дня опирается на то, что человек действительно
+    сохранил для этого дня (AC10, AC11). Заготовка недельного плана здесь не
+    подставляется: воскресный расчёт должен видеть пустое меню, если
+    понедельник не заполнен, а не чужие блюда.
+    """
+    return list(load_days(st.session_state.store).get(day.isoformat(), ()))
+
+
+def next_day_menu_for(day: date) -> tuple[MenuLine, ...]:
+    """Меню дня, к которому готовит смена `day`."""
+    return tuple(stored_menu(prep_target_day(day)))
+
+
+def compute_plan(menu: list[MenuLine]):
+    """Сценарий смены целиком: настройки, статусы, комментарии и отклонения.
+
+    Всё, что человек ввёл сам, доходит до расчёта отсюда, поэтому план
+    показывает ровно ту смену, которую настроили, а не расчёт по умолчанию.
+    """
+    notes = deviation_store.load_day_notes(st.session_state.day, notes_path())
+    deviations = deviation_store.load_deviations(st.session_state.day, notes_path())
+    settings: dict = day_inputs() if has_saved_settings() else {}
+    scenario = build_scenario(
+        data_for(menu),
+        st.session_state.day,
+        menu=tuple(menu),
+        next_menu=next_day_menu_for(st.session_state.day),
+        duty_settings=duty_settings_from(settings) if settings else None,
+        staff_settings=staff_settings_from(settings) if settings else None,
+        overrides=status_store.overrides_for_day(st.session_state.day, status_path()),
+        notes=tuple(sorted(notes.items())),
+        deviations=tuple(
+            (item_id, record.kind) for item_id, record in sorted(deviations.items())
+        ),
+    )
+    # Сценарий кладём в сессию: все вкладки обязаны показывать одну и ту же
+    # смену, иначе маршруты, отчёт и экспорт могут опираться на разные расчёты.
+    st.session_state.scenario = scenario
+    return scenario
+
+
+def save_status(item_id: str, status: str) -> None:
+    """Запоминает отметку человека по конкретной работе."""
+    status_store.save_statuses(
+        {st.session_state.day.isoformat(): ((item_id, status),)},
+        status_path(),
+    )
+    invalidate_plan()
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +327,8 @@ def bootstrap() -> None:
     st.session_state.preview = None
     st.session_state.scale_factor = 1.0
     st.session_state.sheet = None
+    st.session_state.plan = None
+    st.session_state.scenario = None
     st.session_state.excel_bytes = None
     st.session_state.excel_name = ""
 
@@ -166,6 +344,13 @@ def invalidate_sheet() -> None:
     st.session_state.sheet = None
     st.session_state.excel_bytes = None
     st.session_state.excel_name = ""
+
+
+def invalidate_plan() -> None:
+    """Сброс кэша расчёта: план зависит и от меню, и от введённых статусов."""
+    invalidate_sheet()
+    st.session_state.plan = None
+    st.session_state.scenario = None
 
 
 def on_day_changed() -> None:
@@ -186,12 +371,27 @@ def on_day_changed() -> None:
         st.session_state._weekday = st.session_state.weekday
     else:
         st.session_state._weekday = WEEKDAYS[0]
+    _reset_day_widgets()
     st.session_state.menu, st.session_state.menu_source = menu_for_day(
         new_day, load_days(st.session_state.store)
     )
     st.session_state.preview = None
     st.session_state.menu_seed += 1
-    invalidate_sheet()
+    invalidate_plan()
+
+
+def _reset_day_widgets() -> None:
+    """Забывает значения виджетов, привязанных к выбранному дню.
+
+    Без сброса форма настроек показывала бы данные прежнего дня: Streamlit
+    игнорирует новый `value=`, если ключ виджета уже есть в session_state.
+    """
+    for key in [
+        key
+        for key in st.session_state
+        if key in _DAY_WIDGET_KEYS or key.startswith(_DAY_WIDGET_PREFIXES)
+    ]:
+        del st.session_state[key]
 
 
 def on_weekday_changed() -> None:
@@ -203,7 +403,7 @@ def on_weekday_changed() -> None:
     st.session_state.menu_source = f"план «{st.session_state.weekday}»"
     st.session_state.preview = None
     st.session_state.menu_seed += 1
-    invalidate_sheet()
+    invalidate_plan()
 
 
 def on_add_dish() -> None:
@@ -216,7 +416,7 @@ def on_add_dish() -> None:
     st.session_state.menu = sort_menu(st.session_state.menu + [line])
     st.session_state.preview = None
     st.session_state.menu_seed += 1
-    invalidate_sheet()
+    invalidate_plan()
     persist_store()
 
 
@@ -226,7 +426,7 @@ def on_apply_scale() -> None:
     )
     st.session_state.preview = None
     st.session_state.menu_seed += 1
-    invalidate_sheet()
+    invalidate_plan()
     persist_store()
 
 
@@ -302,7 +502,7 @@ def render_menu_editor() -> None:
     if tuple(new_menu) != tuple(sort_menu(st.session_state.menu)):
         st.session_state.menu = new_menu
         st.session_state.preview = None
-        invalidate_sheet()
+        invalidate_plan()
         persist_store()
     st.caption("Отметьте «Убрать», чтобы исключить блюдо; порции и время выдачи "
                "правятся прямо в таблице.")
@@ -405,17 +605,20 @@ def render_calc_tab() -> None:
                    f"меню: {len(st.session_state.menu)} строк · "
                    f"порций: {sum(line.portions for line in st.session_state.menu)}")
     if st.button("Рассчитать смену", type="primary", width="stretch"):
-        sheet, error = compute_sheet(st.session_state.menu)
+        scenario = compute_plan(st.session_state.menu)
+        sheet, error = compute_sheet(st.session_state.menu, scenario.plan)
         if error:
             st.error(error)
         else:
             st.session_state.sheet = sheet
     sheet = st.session_state.sheet
     if sheet is None:
-        sheet, error = compute_sheet(st.session_state.menu)
+        scenario = compute_plan(st.session_state.menu)
+        sheet, error = compute_sheet(st.session_state.menu, scenario.plan)
         if error:
             st.info(error)
             return
+        st.session_state.sheet = sheet
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Порций", sheet.portions)
     col2.metric("Блюд", sheet.dishes)
@@ -489,7 +692,8 @@ def render_products_tab() -> None:
 
 def render_tasks_tab() -> None:
     st.subheader("Задачи по ролям")
-    sheet, error = compute_sheet(st.session_state.menu)
+    scenario = compute_plan(st.session_state.menu)
+    sheet, error = compute_sheet(st.session_state.menu, scenario.plan)
     if error:
         st.info(error)
         return
@@ -520,11 +724,555 @@ def render_tasks_tab() -> None:
             )
 
 
+def render_routes_tab() -> None:
+    st.subheader("Маршруты по сотрудникам")
+    scenario = compute_plan(st.session_state.menu)
+    plan = scenario.plan
+
+    if not plan.staff:
+        st.warning(
+            "Состав бригады на этот день не задан: маршруты построить нельзя. "
+            "Задайте состав в настройках смены или выберите будний день."
+        )
+    counts = plan.status_counts()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Готовность смены", "готова" if plan.ready else "не готова")
+    col2.metric("Не заполнено", len(plan.gaps))
+    col3.metric("Работ в маршрутах", sum(len(r.items) for r in plan.routes))
+    if counts:
+        st.caption(" · ".join(f"{name}: {value}" for name, value in counts.items() if value))
+
+    if plan.gaps:
+        st.warning("Смена не готова: перечисленное ниже не заполнено.")
+        for line in gaps_text(plan.gaps).splitlines():
+            st.write(line)
+
+    st.subheader("Отметки по работам")
+    st.caption(
+        "Статус сохраняется локально и относится только к этой работе. "
+        "После пересчёта отметки остаются на своих местах."
+    )
+    rows = []
+    for item in plan.items:
+        rows.append(
+            {
+                "id": item.item_id,
+                "Время": item.span,
+                "Операция": item.operation,
+                "Статус": item.status,
+                "Отметка человека": item.claimed_status,
+                "Комментарий": item.comment,
+                "Отклонение": DEVIATION_LABELS.get(item.deviation, ""),
+            }
+        )
+    if rows:
+        edited = st.data_editor(
+            pd.DataFrame(rows),
+            hide_index=True,
+            width="stretch",
+            disabled=[
+                "id",
+                "Время",
+                "Операция",
+                "Отметка человека",
+                "Комментарий",
+                "Отклонение",
+            ],
+            column_config={
+                "id": st.column_config.TextColumn("id", width="small"),
+                "Статус": st.column_config.SelectboxColumn(
+                    "Статус", options=list(STATUSES), required=True
+                ),
+            },
+        )
+        _apply_status_changes(edited, plan)
+        _explain_claimed(plan)
+
+    if plan.legacy:
+        st.subheader("Исторические записи прежней выдачи")
+        st.caption(
+            "До разделения выдачи на роли работа имела один общий ID. Прежние "
+            "статус, комментарий и отклонение сохранены, но исполнитель из "
+            "хранилища не установлен: записи не переносятся на новую бригаду и "
+            "не меняют готовность плана."
+        )
+        for record in plan.legacy:
+            st.write(record.message)
+
+    for route in plan.routes:
+        employee = route.employee
+        title = f"{employee.name} · {employee.role} · {len(route.items)} работ"
+        with st.expander(title):
+            st.code(route_form(scenario, employee).to_text(), language=None)
+            st.download_button(
+                f"Скачать маршрут: {employee.name}",
+                data=route_form(scenario, employee).to_text().encode("utf-8"),
+                file_name=f"маршрут_{_safe_name(employee.name)}.txt",
+            )
+
+
+def _explain_claimed(plan) -> None:
+    """Показывает разницу между фактом и допустимостью (AC08, AC15).
+
+    Отметка человека не снимает нарушение ограничения, поэтому обе строки
+    показываются рядом: «выполнено по факту» и «нарушает правило».
+    """
+    claimed = [i for i in plan.items if i.claimed_status]
+    if not claimed:
+        return
+    st.info(
+        "Отметка «выполнено» не снимает нарушение ограничения: работа остаётся "
+        "заблокированной, а ваш факт сохранён отдельно."
+    )
+    for item in claimed:
+        st.write(
+            f"{item.span} · {item.operation} — факт: {item.claimed_status}; "
+            f"причина блокировки: {item.reason or 'нарушение ограничения'}"
+        )
+
+
+def _apply_status_changes(edited: pd.DataFrame, plan) -> None:
+    """Сохраняет только реально изменившиеся статусы."""
+    before = {item.item_id: item.status for item in plan.items}
+    changed = [
+        (str(row["id"]), str(row["Статус"]).upper())
+        for _, row in edited.iterrows()
+        if str(row["id"]) in before and str(row["Статус"]).upper() != before[str(row["id"])]
+    ]
+    if not changed:
+        return
+    for item_id, status in changed:
+        save_status(item_id, status)
+    st.rerun()
+
+
+def _safe_name(name: str) -> str:
+    return "-".join(
+        "".join(ch if ch.isalnum() or ch in " -" else "_" for ch in name).split()
+    ) or "сотрудник"
+
+
+def render_settings_tab() -> None:
+    """Ввод того, чего нет в источнике: длительности, окна, состав, бракераж.
+
+    Форма показывает только обязанности выбранного дня: субботние окна не нужны
+    в понедельник и наоборот, а лишние поля в форме только мешают.
+    """
+    st.subheader("Настройки смены")
+    st.caption(
+        "Здесь вводятся значения, которых нет в плане: длительности и окна "
+        "работ, состав бригады и исполнитель бракеража. Пустое поле остаётся "
+        "незаполненным и попадает в план как пропуск — ничего не подставляется "
+        "за вас. Настройки хранятся локально и не попадают в Excel."
+    )
+
+    inputs = day_inputs()
+    day = st.session_state.day
+    mode = _mode_of(day)
+    applicable = duties_for(day.weekday(), mode)
+
+    with st.form("settings_form"):
+        st.markdown("**Обязанности дня**")
+        durations: dict[str, str] = {}
+        windows: dict[str, str] = {}
+        for duty in applicable:
+            label = f"{duty.source} · {duty.operation}"
+            known = duty.duration_min
+            durations[duty.key] = st.text_input(
+                f"Длительность, мин — {label}",
+                value=inputs["durations"].get(duty.key, ""),
+                placeholder="не задана в источнике" if known is None else str(known),
+                key=f"duration_{duty.key}",
+            )
+            windows[duty.key] = st.text_input(
+                f"Окно работы — {label}",
+                value=inputs["windows"].get(duty.key, ""),
+                placeholder=_window_placeholder(duty),
+                key=f"window_{duty.key}",
+            )
+
+        st.markdown("**Персонал**")
+        staff_text = inputs["staff"]
+        counts = {
+            key: st.text_input(
+                f"Количество — {_COUNT_LABELS[key]}",
+                value=staff_text.get(key, ""),
+                key=f"count_{key}",
+            )
+            for key in settings_store.COUNT_KEYS
+        }
+        staff_rows = {
+            key: st.text_input(
+                f"Сотрудник — {key} (роль|смена|перерывы)",
+                value=staff_text.get(key, ""),
+                placeholder="Шеф-повар 1|Шеф-повар|08:00–17:00|09:00–09:30",
+                key=f"staff_{key}",
+            )
+            for key in sorted(
+                k for k in staff_text if k not in settings_store.COUNT_KEYS
+            )
+        }
+        weekend = {
+            key: st.text_area(
+                f"Состав — {_WEEKEND_LABELS[key]} (имя|роль|смена, по строке)",
+                value=staff_text.get(key, ""),
+                placeholder="Разнорабочий (суб)|Разнорабочий|08:00–14:00",
+                key=f"weekend_{key}",
+            )
+            for key in settings_store.WEEKEND_KEYS
+        }
+        new_staff_name = st.text_input(
+            "Добавить сотрудника: имя",
+            value="",
+            key="new_staff_name",
+        )
+        new_staff_row = st.text_input(
+            "Добавить сотрудника: роль|смена|перерывы",
+            value="",
+            key="new_staff_row",
+        )
+        tasting = st.text_input(
+            "Исполнитель бракеража",
+            value=inputs["tasting"],
+            placeholder="без настройки точка остаётся неназначенной",
+            key="tasting_executor",
+        )
+        disabled = st.multiselect(
+            "Не выполнять на этот день",
+            [d.key for d in applicable],
+            default=[k for k in inputs.get("disabled", []) if k in {d.key for d in applicable}],
+            key="disabled_duties",
+        )
+        apply_to_all = st.checkbox(
+            "Сохранить как общие настройки для всех дней",
+            value=False,
+            key="settings_shared",
+        )
+        submitted = st.form_submit_button("Сохранить настройки")
+
+    if submitted:
+        payload = {
+            "durations": {k: v for k, v in durations.items() if v.strip()},
+            "windows": {k: v for k, v in windows.items() if v.strip()},
+            "staff": {
+                **{k: v for k, v in counts.items() if v.strip()},
+                **{k: v for k, v in staff_rows.items() if v.strip()},
+                **{k: v for k, v in weekend.items() if v.strip()},
+            },
+            "tasting": tasting.strip(),
+            "disabled": list(disabled),
+        }
+        if new_staff_name.strip() and new_staff_row.strip():
+            payload["staff"][new_staff_name.strip()] = new_staff_row.strip()
+        try:
+            _validate_settings(payload)
+        except ValueError as exc:
+            st.error(f"Настройки не сохранены: {exc}")
+            return
+        save_day_inputs(day, payload, settings_path())
+        if apply_to_all:
+            save_settings(payload, settings_path())
+        invalidate_plan()
+        st.rerun()
+
+    if inputs["tasting"]:
+        st.caption(f"Бракераж на этот день: {inputs['tasting']}")
+    elif not has_saved_settings():
+        st.info(
+            "Настройки ещё не сохранялись: план построен по значениям по "
+            "умолчанию. Состав бригады в них — заглушка, а не подтверждённые "
+            "данные; задайте свой состав."
+        )
+
+
+def _validate_settings(payload: dict) -> None:
+    """Проверяет ввод до сохранения: понятная ошибка лучше пустого расчёта."""
+    duty_settings_from(payload)
+    staff_settings_from(payload)
+
+
+def _mode_of(day: date) -> str:
+    """Режим дня по тем же календарным правилам, что и расчёт."""
+    return calendar_rules.mode_for(day)
+
+
+def _window_placeholder(duty) -> str:
+    if duty.window is not None:
+        return f"из плана: {duty.window[0]:%H:%M}–{duty.window[1]:%H:%M}"
+    return "не задано в источнике"
+
+
+def render_notes_tab() -> None:
+    """Комментарии и отклонения по конкретным работам (п. 42, AC12)."""
+    st.subheader("Отклонения и комментарии")
+    scenario = compute_plan(st.session_state.menu)
+    plan = scenario.plan
+
+    st.caption(
+        "Отклонение — причина с типом: задержка, отсутствие или замена продукта, "
+        "изменение порций, проблема оборудования или другая причина. "
+        "Комментарий и причина привязаны к конкретной работе и переживают "
+        "пересчёт; статус выполнения хранится отдельно."
+    )
+
+    rows = []
+    stored = deviation_store.load_deviations(st.session_state.day, notes_path())
+    for item in plan.items:
+        record = stored.get(item.item_id)
+        rows.append(
+            {
+                "id": item.item_id,
+                "Время": item.span,
+                "Операция": item.operation,
+                "Комментарий": item.comment,
+                "Отклонение": item.deviation or deviation_store.NO_DEVIATION_KIND,
+                "Минуты": str(record.minutes) if record else "",
+            }
+        )
+    for legacy in plan.legacy:
+        # PA-03: старую запись показываем строкой формы, чтобы сохранение
+        # нового дня не стёрло её молча. Строка не привязана к человеку:
+        # исполнитель прежней единой выдачи неизвестен.
+        saved = stored.get(legacy.item_id)
+        rows.append(
+            {
+                "id": legacy.item_id,
+                "Время": "—",
+                "Операция": f"{legacy.operation} (историческая запись)",
+                "Комментарий": legacy.comment or (saved.comment if saved else ""),
+                "Отклонение": legacy.deviation
+                or deviation_store.NO_DEVIATION_KIND,
+                "Минуты": str(saved.minutes) if saved else "",
+            }
+        )
+    if not rows:
+        st.warning("Работ на этот день нет: записывать нечего.")
+        return
+
+    edited = st.data_editor(
+        pd.DataFrame(rows),
+        hide_index=True,
+        width="stretch",
+        disabled=["id", "Время", "Операция"],
+        column_config={
+            "id": st.column_config.TextColumn("id", width="small"),
+            "Отклонение": st.column_config.SelectboxColumn(
+                "Отклонение",
+                options=[NO_DEVIATION, *deviation_store.deviation_kinds()],
+            ),
+        },
+        key="notes_editor",
+    )
+    if st.button("Сохранить комментарии и отклонения", width="stretch"):
+        _save_notes(edited)
+
+    saved = deviation_store.saved_rows(st.session_state.day, notes_path())
+    if saved:
+        st.markdown("**Сохранённые записи**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "id": row["id"],
+                        "Комментарий": row["comment"],
+                        "Отклонение": row["label"],
+                        "Минуты": row["minutes"],
+                    }
+                    for row in saved
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.caption("Сохранённых комментариев и отклонений за этот день нет.")
+
+
+def _save_notes(edited: pd.DataFrame) -> None:
+    """Сохраняет комментарии и отклонения, отвергая незаполненные причины."""
+    rows = [
+        {
+            "id": row["id"],
+            "comment": row.get("Комментарий", ""),
+            "kind": row.get("Отклонение", ""),
+            "minutes": row.get("Минуты", ""),
+        }
+        for _, row in edited.iterrows()
+    ]
+    saved, problems = deviation_store.save_from_rows(
+        st.session_state.day, rows, notes_path()
+    )
+    if problems:
+        st.error(
+            "Не сохранено. Для отклонения укажите пояснение (и минуты, если это "
+            "задержка):\n\n" + "\n\n".join(problems)
+        )
+        return
+    invalidate_plan()
+    st.rerun()
+
+
+def render_report_tab() -> None:
+    """Субботний отчёт: расход, выход полуфабрикатов и маркировка (AC09)."""
+    st.subheader("Отчёт за субботу")
+    scenario = compute_plan(st.session_state.menu)
+    day = st.session_state.day
+    if day.weekday() != 5:
+        st.info("Отчёт заполняется за субботу. Выберите рабочую дату — субботу.")
+        return
+
+    saved = report_store.load_report(day, report_path()) or SaturdayReport(day=day)
+    product_units = {
+        need.product: need.unit
+        for group in scenario.needs
+        for need in group.items
+    }
+    products = sorted(product_units)
+    if not products:
+        st.warning("Нет продуктов в плане: заполнять нечего.")
+        return
+
+    st.caption(
+        "Расход сырья и выход полуфабриката — разные величины в своих единицах: "
+        "норма выхода в источнике не подтверждена, поэтому выход остаётся пустым, "
+        "пока вы его не введёте. Отчёт ничего не списывает со склада."
+    )
+
+    with st.form("saturday_report"):
+        consumption: dict[str, float] = {}
+        qty: dict[str, float] = {}
+        units: dict[str, str] = {}
+        names: dict[str, str] = {}
+        made: dict[str, date] = {}
+        expires: dict[str, date] = {}
+        for product in products:
+            st.markdown(f"**{product}**")
+            col1, col2, col3 = st.columns(3)
+            consumption[product] = _qty_input(
+                col1, f"Расход факт — {product}", saved.consumption.get(product),
+                f"consumption_{product}",
+            )
+            unit = saved.outputs.get(product)
+            qty[product] = _qty_input(
+                col2, f"Выход — {product}", unit.qty if unit else None, f"output_{product}"
+            )
+            units[product] = col2.text_input(
+                f"Ед. выхода — {product}",
+                value=unit.unit if unit else "",
+                key=f"output_unit_{product}",
+            )
+            marking = saved.markings.get(product)
+            names[product] = col3.text_input(
+                f"Название полуфабриката — {product}",
+                value=marking.name if marking else "",
+                key=f"marking_{product}",
+            )
+            col4, col5 = st.columns(2)
+            made[product] = col4.date_input(
+                f"Дата производства — {product}",
+                value=marking.made if marking and marking.made else day,
+                key=f"made_{product}",
+            )
+            expires[product] = col5.date_input(
+                f"Срок годности — {product}",
+                value=marking.expires if marking and marking.expires else day,
+                key=f"expires_{product}",
+            )
+        submitted = st.form_submit_button("Сохранить отчёт")
+
+    if submitted:
+        # Единица расхода сохраняется рядом с количеством: она относится к
+        # факту, а не к текущему меню, и переживает его изменение или очистку.
+        consumption_units = {
+            k: (product_units.get(k) or saved.consumption_units.get(k, ""))
+            for k in products
+            if consumption.get(k)
+            and (product_units.get(k) or saved.consumption_units.get(k, ""))
+        }
+        report = SaturdayReport(
+            day=day,
+            consumption={k: v for k, v in consumption.items() if v},
+            consumption_units=consumption_units,
+            outputs={
+                k: SemifinishedOutput(qty=qty[k], unit=units[k].strip())
+                for k in products
+                if qty.get(k)
+            },
+            markings={
+                k: SemifinishedMarking(
+                    name=names[k].strip(), made=made[k], expires=expires[k]
+                )
+                for k in products
+                if qty.get(k)
+            },
+        )
+        missing = report.incomplete_markings
+        if missing:
+            st.error(
+                "Отчёт не сохранён: у полуфабрикатов не заполнено название, "
+                "дата производства или срок годности — " + ", ".join(missing)
+            )
+            return
+        report_store.save_report(day, report, report_path())
+        st.success("Отчёт сохранён локально.")
+        st.code(
+            saturday_report_form(
+                scenario,
+                actuals=report.consumption,
+                outputs=report.outputs,
+                markings=report.markings,
+            ).to_text(),
+            language=None,
+        )
+
+
+def _qty_input(column, label: str, value: float | None, key: str) -> float:
+    """Числовое поле количества: пустое поле — это «не заполнено», а не ноль."""
+    try:
+        current = float(value) if value else None
+    except (TypeError, ValueError):
+        current = None
+    return column.number_input(
+        label, min_value=0.0, value=current, step=0.5, key=key
+    ) or 0.0
+
+
+def _saturday_report_export(scenario):
+    """Форма сохранённого субботнего отчёта или None в другой день.
+
+    Отчёт не зависит от текущего меню: это отдельно сохранённый факт, поэтому
+    его форма собирается независимо от книги и печатается даже после очистки
+    меню (AC09, AC14).
+    """
+    if st.session_state.day.weekday() != 5:
+        return None
+    report = saved_report()
+    facts = (
+        {}
+        if report is None
+        else {
+            "actuals": dict(report.consumption),
+            "actual_units": dict(report.consumption_units),
+            "outputs": dict(report.outputs),
+            "markings": dict(report.markings),
+        }
+    )
+    return saturday_report_form(scenario, **facts)
+
+
 def render_export_tab() -> None:
     st.subheader("Экспорт")
-    sheet, error = compute_sheet(st.session_state.menu)
+    scenario = compute_plan(st.session_state.menu)
+    sheet, error = compute_sheet(st.session_state.menu, scenario.plan)
     if error:
         st.info(error)
+        report_form = _saturday_report_export(scenario)
+        if report_form is not None:
+            st.download_button(
+                f"Скачать: {report_form.title}",
+                data=report_form.to_text().encode("utf-8"),
+                file_name=f"{_safe_name(report_form.title)}.txt",
+            )
         return
 
     if st.button("Собрать книгу Excel", width="stretch"):
@@ -533,7 +1281,9 @@ def render_export_tab() -> None:
             folder = Path(tempfile.gettempdir()) / "shegchef_exports"
             folder.mkdir(parents=True, exist_ok=True)
             name = f"Кухня_конструктор_{st.session_state.day:%d_%m_%Y}.xlsx"
-            path = build_workbook(data, build_shift_sheet(data), folder / name)
+            path = build_workbook(
+                data, build_shift_sheet(data, plan=scenario.plan), folder / name
+            )
             st.session_state.excel_bytes = path.read_bytes()
             st.session_state.excel_name = path.name
             st.success(f"Книга собрана: {path.name}")
@@ -580,6 +1330,21 @@ def render_export_tab() -> None:
                 key=f"copy_text_{message.role}",
             )
 
+    st.divider()
+    st.subheader("Печатные формы")
+    st.caption("Общий план, маршрут каждого сотрудника и субботний отчёт — "
+               "обычный текст с фиксированными колонками.")
+    forms = [general_plan_form(scenario), *routes_by_form(scenario)]
+    report_form = _saturday_report_export(scenario)
+    if report_form is not None:
+        forms.append(report_form)
+    for form in forms:
+        st.download_button(
+            f"Скачать: {form.title}",
+            data=form.to_text().encode("utf-8"),
+            file_name=f"{_safe_name(form.title)}.txt",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Сборка интерфейса
@@ -624,11 +1389,21 @@ def main() -> None:
             st.session_state.preview = None
             st.session_state.menu_source = "пустое меню"
             st.session_state.menu_seed += 1
-            invalidate_sheet()
+            invalidate_plan()
             persist_store()
             st.rerun()
 
-    tab_menu, tab_calc, tab_products, tab_tasks, tab_export = st.tabs(TABS)
+    (
+        tab_menu,
+        tab_calc,
+        tab_products,
+        tab_tasks,
+        tab_routes,
+        tab_export,
+        tab_settings,
+        tab_notes,
+        tab_report,
+    ) = st.tabs(TABS)
     with tab_menu:
         render_menu_tab()
     with tab_calc:
@@ -637,8 +1412,16 @@ def main() -> None:
         render_products_tab()
     with tab_tasks:
         render_tasks_tab()
+    with tab_routes:
+        render_routes_tab()
     with tab_export:
         render_export_tab()
+    with tab_settings:
+        render_settings_tab()
+    with tab_notes:
+        render_notes_tab()
+    with tab_report:
+        render_report_tab()
 
 
 if __name__ == "__main__":

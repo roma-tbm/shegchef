@@ -24,17 +24,35 @@ import math
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 
 from kitchen.core import build_shift_sheet
+from kitchen.core.planner import ShiftPlan
 from kitchen.excel import PLAN_SHEET, build_workbook, picker, plan_for, read_menu, read_plan
-from kitchen.menu_week import WEEK_PLAN
+from kitchen.menu_week import WEEKDAYS, WEEK_PLAN, normalize_weekday
 from kitchen.models import KitchenData, MenuLine, PlanLine
 from kitchen.seed import demo_data
+from kitchen.web import deviation_store, menu_store, report_store, settings_store
+from kitchen.web.report_store import SaturdayReport
 from kitchen.web.scaling import ScaleError, scale_menu
+from kitchen.web.shift_plan import (
+    Printable,
+    ShiftScenario,
+    build_scenario,
+    gaps_text,
+    general_plan_form,
+    prep_target_day,
+    route_form,
+    saturday_report_form,
+)
 
 DEFAULT_OUT = Path("Кухня_конструктор.xlsx")
+
+#: Имя папки с печатными формами. Класть её рядом с книгой — чтобы формы и
+#: расчёт лежали рядом, а не разлетались по рабочему каталогу.
+PRINT_DIR_NAME = "Печатные формы"
 
 
 def _known_recipes() -> dict:
@@ -201,6 +219,203 @@ def _with_search(
     return _rebuilt(data, menu), f"подбор «{query}»", report
 
 
+def _resolve_settings(args) -> Path | None:
+    """Путь файла настроек: заданный пользователем или тот, что рядом с меню.
+
+    Настройки добровольны: их нет — расчёт идёт с видимыми пропусками по
+    длительностям, а не с выдуманными нормами.
+    """
+    if args.settings:
+        return args.settings
+    candidate = settings_store.default_settings_path(args.out)
+    return candidate if candidate.exists() else None
+
+
+def _resolve_notes(args) -> Path | None:
+    """Путь файла комментариев и отклонений, если он уже есть."""
+    if args.notes:
+        return args.notes
+    candidate = deviation_store.default_notes_path(args.out)
+    return candidate if candidate.exists() else None
+
+
+def _stored_menu(day: date, out: Path) -> tuple[MenuLine, ...]:
+    """Меню даты из пользовательского JSON-хранилища рядом с книгой.
+
+    Хранилище одно и то же для интерфейса и CLI: иначе воскресный расчёт на
+    бумаге опирался бы на другой источник, чем на экране (AC10, AC11).
+    """
+    path = Path(out).with_name("меню.json")
+    if not path.exists():
+        return ()
+    return tuple(menu_store.load_days(path).get(day.isoformat(), ()))
+
+
+def _next_day_menu(data: KitchenData, day: date, out: Path) -> tuple[MenuLine, ...]:
+    """Меню дня, к которому готовит смена `day`.
+
+    Источники по приоритету: сохранённое меню пользователя, лист «План меню»
+    книги (его тоже правят руками) и только потом — строки, которые уже лежат
+    в данных. Подменять день нельзя: отсутствие меню остаётся причиной,
+    которую печатает планировщик (AC11, AC15).
+    """
+    target = prep_target_day(day)
+    stored = _stored_menu(target, out)
+    if stored:
+        return stored
+    if Path(out).exists():
+        try:
+            plan = read_plan(out, _known_recipes())
+        except Exception:  # noqa: BLE001 - книга может быть не нашей
+            plan = ()
+        if plan and target.weekday() < len(WEEKDAYS):
+            rows = plan_for(plan, normalize_weekday(WEEKDAYS[target.weekday()]) or "")
+            if rows:
+                return tuple(
+                    MenuLine(r.recipe, r.portions, r.serve_at, r.meal, target)
+                    for r in rows
+                )
+    return tuple(line for line in data.menu if line.day == target and line.portions > 0)
+
+
+def _scenario_with_settings(
+    data: KitchenData,
+    day: date,
+    settings_file: Path | None,
+    notes_file: Path | None,
+    *,
+    next_menu: tuple[MenuLine, ...] = (),
+    out: Path | None = None,
+) -> ShiftScenario:
+    """Сценарий смены с настройками и записями человека.
+
+    CLI и интерфейс читают одни и те же файлы, поэтому расчёт на бумаге и на
+    экране не может разойтись из-за разных источников настроек.
+    """
+    notes, deviations = _stored_records(day, notes_file)
+    next_menu = next_menu or _next_day_menu(data, day, out or Path(DEFAULT_OUT))
+    if not settings_file:
+        # Настроек нет: расчёт идёт с обычными настройками, а не с пустым
+        # составом — иначе CLI тихо печатал бы пустые маршруты. Записи
+        # человека при этом сохраняются: они не часть настроек.
+        return build_scenario(
+            data, day, next_menu=next_menu, notes=notes, deviations=deviations
+        )
+    raw = settings_store.load_day_inputs(day, settings_file)
+    if not any(raw.get(key) for key in settings_store.INPUT_KEYS):
+        return build_scenario(
+            data, day, next_menu=next_menu, notes=notes, deviations=deviations
+        )
+    duty_settings, staff_settings = settings_store.day_inputs_to_settings(raw)
+    if not raw.get("staff"):
+        # Состав пользователь не задавал: остаётся видимая заглушка счёта
+        # поваров, а не ноль сотрудников в маршрутах.
+        staff_settings = None
+    return build_scenario(
+        data,
+        day,
+        next_menu=next_menu,
+        duty_settings=duty_settings,
+        staff_settings=staff_settings,
+        notes=notes,
+        deviations=deviations,
+    )
+
+
+def _stored_records(
+    day: date, notes_file: Path | None
+) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
+    """Комментарии и типы отклонений, введённые человеком, по устойчивым ID."""
+    if notes_file is None:
+        return (), ()
+    notes = tuple(deviation_store.load_day_notes(day, notes_file).items())
+    deviations = tuple(
+        (item_id, record.kind)
+        for item_id, record in deviation_store.load_deviations(day, notes_file).items()
+    )
+    return notes, deviations
+
+
+def _scenario_for(day: date, store: Path, settings_file: Path | None = None) -> ShiftScenario:
+    """Сценарий смены по сохранённому меню пользователя (AC10, AC11).
+
+    Отдельная точка входа для проверок сквозного сценария: меню и хранилище
+    задаются явно, поэтому «воскресенье видит понедельник» можно проверить
+    без запуска книги.
+    """
+    data = replace(demo_data(day), menu=tuple(menu_store.load_days(store).get(day.isoformat(), ())))
+    return build_scenario(
+        data, day, menu=tuple(data.menu), next_menu=_stored_menu(prep_target_day(day), store)
+    )
+
+
+def _saved_report_for(day: date, folder: Path) -> "SaturdayReport | None":
+    """Сохранённый субботний отчёт пользователя, если он уже заполнен (AC09).
+
+    `folder` — каталог рядом с меню/книгой, а не путь к файлу меню:
+    `default_report_path` заменяет последний компонент пути, поэтому для
+    каталога он указал бы на файл рядом с каталогом. Здесь файл отчётов
+    берётся внутри каталога — там же, где его кладёт интерфейс.
+    """
+    base = Path(folder)
+    target = base / "reports.json" if base.is_dir() else base
+    return report_store.load_report(day, target)
+
+
+def _saved_facts(report: "SaturdayReport | None") -> dict:
+    """Аргументы печатной формы из сохранённого отчёта.
+
+    Отсутствие отчёта — это пустые факты, а не ошибка: форму субботнего отчёта
+    можно напечатать и до заполнения, просто она будет пустой.
+    """
+    if report is None:
+        return {}
+    return {
+        "actuals": dict(report.consumption),
+        "actual_units": dict(report.consumption_units),
+        "outputs": dict(report.outputs),
+        "markings": dict(report.markings),
+    }
+
+
+def _printout_files(
+    scenario: ShiftScenario,
+    out_dir: Path,
+    *,
+    report: "SaturdayReport | None" = None,
+) -> list[Path]:
+    """Пишет печатные формы по одному файлу на сотрудника и на отчёт.
+
+    Субботний отчёт печатается по сохранённому факту, а не по пустому
+    шаблону: иначе после перезапуска отчёт, который человек заполнил,
+    выглядел бы потерянным (AC09, AC14).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    forms: list[tuple[Printable, str]] = [(general_plan_form(scenario), "Общий план")]
+    for employee in scenario.plan.staff:
+        forms.append((route_form(scenario, employee), _file_name(employee.name)))
+    if scenario.day.weekday() == 5:
+        forms.append(
+            (
+                saturday_report_form(scenario, **_saved_facts(report)),
+                "Субботний отчёт",
+            )
+        )
+
+    written: list[Path] = []
+    for form, name in forms:
+        path = out_dir / f"{name} — {scenario.day:%Y-%m-%d}.txt"
+        path.write_text(form.to_text(), encoding="utf-8")
+        written.append(path)
+    return written
+
+
+def _file_name(name: str) -> str:
+    """Имя сотрудника в имени файла: пробелы заменены, спецсимволы убраны."""
+    safe = "".join(ch if ch.isalnum() or ch in " -" else "_" for ch in name)
+    return "-".join(safe.split()) or "Сотрудник"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Собрать книгу конструктора кухни."
@@ -222,6 +437,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="единый коэффициент масштабирования порций "
                              "(например 1.3). Применяется к выбранному меню перед "
                              "расчётом смены; округление порций до целых, минимум 1")
+    parser.add_argument("--settings", type=Path, default=None,
+                        help="файл настроек смены (по умолчанию settings.json "
+                             "рядом с меню). Там длительности, окна, состав и "
+                             "исполнитель бракеража — те же данные, что вводятся "
+                             "во вкладке «Настройки смены»")
+    parser.add_argument("--notes", type=Path, default=None,
+                        help="файл комментариев и отклонений (по умолчанию "
+                             "notes.json рядом с меню)")
+    parser.add_argument("--print-dir", type=Path, default=None,
+                        help="папка для печатных форм (по умолчанию «"
+                             + PRINT_DIR_NAME + "» рядом с книгой)")
+    parser.add_argument("--no-print", action="store_true",
+                        help="не выгружать печатные формы")
     parser.add_argument("--no-open", action="store_true",
                         help="не открывать результат")
     args = parser.parse_args(argv)
@@ -272,7 +500,19 @@ def main(argv: list[str] | None = None) -> int:
         print("Меню пустое: заполните лист «Конструктор меню».", file=sys.stderr)
         return 1
 
-    sheet = build_shift_sheet(data)
+    settings_file = _resolve_settings(args)
+    notes_file = _resolve_notes(args)
+    try:
+        scenario = _scenario_with_settings(
+            data, day, settings_file, notes_file, out=args.out
+        )
+    except ValueError as exc:
+        print(f"Настройки смены не разобраны: {exc}", file=sys.stderr)
+        return 2
+
+    # Книга собирается по тому же авторитетному плану, что и маршруты: иначе
+    # Excel показывал бы старое расписание, расходясь с бумажным маршрутом.
+    sheet = build_shift_sheet(data, plan=scenario.plan)
     try:
         path = build_workbook(data, sheet, args.out)
     except PermissionError:
@@ -298,6 +538,28 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Задач: {len(sheet.tasks)}, смена {sheet.shift_start:%H:%M}–{sheet.shift_end:%H:%M}")
     for warning in sheet.warnings:
         print(f"  ! {warning}")
+
+    plan = scenario.plan
+    counts = plan.status_counts()
+    print(
+        "План смены: "
+        + ", ".join(f"{name} — {counts.get(name, 0)}" for name in sorted(counts))
+    )
+    if plan.gaps:
+        print("Не заполнено:")
+        for line in gaps_text(plan.gaps).splitlines():
+            print(f"  ! {line.lstrip('• ')}")
+
+    if not args.no_print:
+        print_dir = args.print_dir or args.out.parent / PRINT_DIR_NAME
+        saved_report = _saved_report_for(day, args.out.parent)
+        try:
+            forms = _printout_files(scenario, print_dir, report=saved_report)
+        except OSError as exc:
+            print(f"Печатные формы не записаны: {exc}", file=sys.stderr)
+        else:
+            print(f"Печатные формы: {len(forms)} шт. в {print_dir}")
+
     print(f"Готово: {path.resolve()}")
 
     if not args.no_open:

@@ -117,6 +117,15 @@ def _task_block(index: int, task: TaskLine) -> str:
         lines.append(f"   Блюдо: {subjects}")
     if task.products:
         lines.append(f"   Продукты: {task.products}")
+    if task.assignee:
+        lines.append(f"   Исполнитель: {task.assignee}")
+    if task.status and task.status != "TODO":
+        status = task.status
+        if task.claimed_status and task.claimed_status != task.status:
+            status += f" (факт: {task.claimed_status})"
+        lines.append(f"   Статус: {status}")
+    if task.comment:
+        lines.append(f"   Комментарий: {task.comment}")
     if task.note:
         lines.append(f"   Примечание: {task.note}")
     return "\n".join(lines)

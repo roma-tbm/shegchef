@@ -208,35 +208,67 @@ def _products(ws: Worksheet, sheet: ShiftSheet) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _status_mark(status: str) -> str:
+    """Отметка выполнения по статусу работы из авторитетного плана."""
+    return {
+        "DONE": "☑",
+        "IN_PROGRESS": "◐",
+        "BLOCKED": "⛔",
+        "SKIPPED": "—",
+    }.get(status or "", "☐")
+
+
+def _remark_cell(task) -> str:
+    """Комментарий, примечание работы и заявленный факт в одной ячейке.
+
+    claimed_status печатается отдельно от расчётного статуса: отметка
+    «сделано» не заменяет BLOCKED и никого не вводит в заблуждение (AC12, AC15).
+    """
+    parts = [p for p in (task.comment, getattr(task, "note", "")) if p]
+    if task.claimed_status and task.claimed_status != task.status:
+        parts.append(f"факт: {task.claimed_status}")
+    return " · ".join(parts) or "—"
+
+
+def _fact_cell(task) -> str:
+    """Заявленный человеком факт отдельной колонкой, а не вместо статуса."""
+    if task.claimed_status and task.claimed_status != task.status:
+        return f"факт: {task.claimed_status}"
+    return "—"
+
+
 def _task_map(ws: Worksheet, sheet: ShiftSheet) -> None:
-    st.set_widths(ws, {"A": 15, "B": 14, "C": 52, "D": 28, "E": 30, "F": 8, "G": 30})
+    st.set_widths(
+        ws, {"A": 15, "B": 14, "C": 52, "D": 28, "E": 30, "F": 16, "G": 8, "H": 30}
+    )
     row = st.write_title(
         ws,
         "Карта задач и обязанностей",
-        f"{sheet.day.strftime(DAY_FMT)} · отметьте «Готово» в колонке F",
+        f"{sheet.day.strftime(DAY_FMT)} · отметьте «Готово» в колонке G",
     )
 
     for role, items in sheet.tasks_by_role:
-        row = st.section_bar(ws, row, role, 7)
+        row = st.section_bar(ws, row, role, 8)
         row = st.table_header(
             ws,
             row,
-            ("Время", "Длит., мин", "Операция", "Блюдо", "Продукты", "Готово",
-             "Примечание"),
+            ("Время", "Длит., мин", "Операция", "Блюдо", "Продукты", "Исполнитель",
+             "Готово", "Примечание"),
         )
         for i, t in enumerate(items):
             row = st.write_row(
                 ws,
                 row,
-                (_span(t.start, t.end), t.duration_min, t.operation, t.source,
-                 t.products or "—", "☐", t.note),
+                (_span(t.start, t.end), t.duration_min, t.operation, t.source or "—",
+                 t.products or "—", t.assignee or "—",
+                 _status_mark(t.status), _remark_cell(t)),
                 zebra=bool(i % 2),
             )
-            ws.cell(row=row - 1, column=6).alignment = Alignment(horizontal="center")
-            ws.cell(row=row - 1, column=6).font = Font(name="Calibri", size=12)
+            ws.cell(row=row - 1, column=7).alignment = Alignment(horizontal="center")
+            ws.cell(row=row - 1, column=7).font = Font(name="Calibri", size=12)
         row += 1
 
-    row = st.section_bar(ws, row, "Нагрузка по ролям", 7)
+    row = st.section_bar(ws, row, "Нагрузка по ролям", 8)
     row = st.table_header(
         ws, row, ("Роль", "Задач", "Пик одновременных", "Нужно человек", "Минут")
     )
@@ -255,7 +287,7 @@ def _task_map(ws: Worksheet, sheet: ShiftSheet) -> None:
         row,
         "Пик выше 1 означает, что в этот момент нужны несколько человек роли. "
         "Роли заданы без имён — распределите людей на magnets-доске.",
-        7,
+        8,
     )
     st.print_setup(ws)
     ws.sheet_view.showGridLines = False
@@ -267,7 +299,11 @@ def _task_map(ws: Worksheet, sheet: ShiftSheet) -> None:
 
 
 def _timeline(ws: Worksheet, sheet: ShiftSheet) -> None:
-    st.set_widths(ws, {"A": 9, "B": 9, "C": 14, "D": 15, "E": 50, "F": 26, "G": 30})
+    st.set_widths(
+        ws,
+        {"A": 9, "B": 9, "C": 14, "D": 15, "E": 50, "F": 26, "G": 30,
+         "H": 16, "I": 12, "J": 14},
+    )
     row = st.write_title(
         ws,
         "Хронология смены",
@@ -279,7 +315,7 @@ def _timeline(ws: Worksheet, sheet: ShiftSheet) -> None:
         ws,
         row,
         ("Начало", "Конец", "Роль", "Приём пищи", "Операция", "Блюдо",
-         "Продукты"),
+         "Продукты", "Исполнитель", "Статус", "Факт"),
     )
 
     last = None
@@ -290,8 +326,9 @@ def _timeline(ws: Worksheet, sheet: ShiftSheet) -> None:
         row = st.write_row(
             ws,
             row,
-            (t.start.time(), t.end.time(), t.role, t.meal, t.operation, t.source,
-             t.products or "—"),
+            (t.start.time(), t.end.time(), t.role, t.meal, t.operation,
+             t.source or "—", t.products or "—", t.assignee or "—",
+             t.status or "—", _fact_cell(t)),
             zebra=band,
         )
         for col in (1, 2):
@@ -303,17 +340,24 @@ def _timeline(ws: Worksheet, sheet: ShiftSheet) -> None:
             ws.cell(row=row - 1, column=5).fill = PatternFill("solid", fgColor=st.BAND)
 
     row += 1
-    row = st.section_bar(ws, row, "Контрольные точки шеф-повара", 7)
-    row = st.table_header(ws, row, ("Начало", "Конец", "Роль", "Операция", "Блюдо", "", ""))
+    row = st.section_bar(ws, row, "Контрольные точки шеф-повара", 9)
+    row = st.table_header(
+        ws, row,
+        ("Начало", "Конец", "Роль", "Операция", "Блюдо", "Исполнитель",
+         "Готово", "Факт", "Примечание"),
+    )
     for i, c in enumerate(sheet.controls):
         row = st.write_row(
             ws,
             row,
-            (c.start.time(), c.end.time(), c.role, c.operation, c.source),
+            (c.start.time(), c.end.time(), c.role, c.operation, c.source,
+             c.assignee or "—", _status_mark(c.status), _fact_cell(c),
+             _remark_cell(c)),
             zebra=bool(i % 2),
         )
         for col in (1, 2):
             ws.cell(row=row - 1, column=col).number_format = TIME_FMT
+        ws.cell(row=row - 1, column=7).alignment = Alignment(horizontal="center")
 
     st.print_setup(ws)
     ws.sheet_view.showGridLines = False

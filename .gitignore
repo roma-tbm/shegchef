@@ -9,3 +9,31 @@ __pycache__/
 
 # Служебное
 .DS_Store
+
+# Локальные материалы разработки
+/AGENTS.md
+/TASK.md
+/QA_TASK.md
+/IMPLEMENTATION_REPORT.md
+/QA_REPORT.md
+/stage3.md
+/summary.md
+/startconcept/
+/tasks/
+/tests/
+/.agents/
+/.codex/
+/.idea/
+/.vscode/
+.coverage
+htmlcov/
+
+# Локальные данные и печатные результаты
+/Печатные формы/
+/.shegchef/
+/меню.json
+/menu.json
+/settings.json
+/notes.json
+/statuses.json
+/reports.json

@@ -84,8 +84,13 @@ def generate_tasks(
 
     Общие операции схлопываются в одну задачу: «Подготовка лука репчатого»
     не превращается в три строки, даже если лук нужен трём блюдам.
+
+    Пустое меню — это допустимое состояние: день без блюд даёт пустую доску,
+    а не ошибку. Обязанности смены в этом случае планируются отдельно.
     """
     selected = [line for line in menu if line.portions > 0]
+    if not selected:
+        return TaskBoard((), {}, {}, ())
     by_recipe = {line.recipe: line for line in selected}
     first_by_meal: dict[str, MenuLine] = {}
     anchor_recipe: dict[str, str] = {}
