@@ -18,7 +18,7 @@ macOS / Linux (Python 3.10+):
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python build.py
+.venv/bin/python build.py --fresh
 ```
 
 Windows 10 (Python 3.10+ должен быть в PATH):
@@ -26,10 +26,11 @@ Windows 10 (Python 3.10+ должен быть в PATH):
 ```bat
 py -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python build.py
+.venv\Scripts\python build.py --fresh
 ```
 
-Книга `Кухня_конструктор.xlsx` соберётся и откроется сама.
+Команда с `--fresh` создаёт книгу `Кухня_конструктор.xlsx` с демо-меню
+и открывает её. Для меню выбранной даты запускайте без `--fresh`, как описано ниже.
 
 Папку `.venv` переносить между компьютерами нельзя — она собрана под
 конкретную ОС и версию Python. На новом компьютере создайте её заново
@@ -51,16 +52,19 @@ Streamlit-сценарии проверяются через `streamlit.testing.
 логика — обычными тестами; тесты изолированы от личных данных в `~/.shegchef`
 (CLI направляется во временный каталог через `SHEGCHEF_DATA_DIR`).
 GitHub Actions (`.github/workflows/tests.yml`) запускает ту же регрессию на
-Python 3.10 и 3.12. Реальный прогон Actions выполняется после push —
-это отдельный этап.
+Python 3.10 и 3.12 при push и pull request.
+12 октября 2026 года [прогон коммита `242be47`](https://github.com/roma-tbm/shegchef/actions/runs/38289161472)
+успешно завершился на обеих версиях Python: **658 passed** в каждом задании.
 
 ## Как пользоваться
 
-1. При первом запуске `build.py` создаст книгу с демо-меню (`--fresh`).
+1. Создайте книгу с демо-меню: `.venv/bin/python build.py --fresh`.
 2. На листе **«Конструктор меню»** выберите блюда в окнах приёмов пищи,
    укажите порции и время выдачи. Для подбора по запросу используйте
    `--search`, как описано ниже: обычный запуск сам блюда не подбирает.
-3. Сохраните и закройте книгу, затем повторите запуск `build.py`.
+3. Сохраните и закройте книгу, затем запустите
+   `.venv/bin/python build.py --from-book`. Для другого имени книги добавьте
+   `--out ПУТЬ`. В Windows используйте `.venv\Scripts\python`.
 
 Обычный запуск без ключей меню **не** берёт из книги. Сначала читается
 сохранённая запись выбранной даты в общем каталоге данных `~/.shegchef`
