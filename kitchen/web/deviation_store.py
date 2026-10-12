@@ -29,8 +29,13 @@ from kitchen.core.deviations import (
     REASON_DELAY,
     Deviation,
 )
+from kitchen.web.store_errors import StoreError, corrupt_message
 
 NOTES_VERSION = 1
+
+
+class NotesStoreError(StoreError):
+    """Файл комментариев и отклонений повреждён или структурно неверен (AC06)."""
 
 #: Пустой выбор типа отклонения в форме: отклонения не было.
 NO_DEVIATION_KIND = ""
@@ -322,9 +327,13 @@ def _load_raw(path: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise NotesStoreError(corrupt_message(path, exc)) from exc
+    if not isinstance(data, dict):
+        raise NotesStoreError(
+            f"файл {path} должен быть словарём JSON, а не {type(data).__name__}"
+        )
+    return data
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -343,6 +352,7 @@ __all__ = [
     "load_day_notes",
     "load_deviations",
     "NO_DEVIATION_KIND",
+    "NotesStoreError",
     "note_inputs",
     "notes_from_rows",
     "save_from_rows",

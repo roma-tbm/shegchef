@@ -33,8 +33,13 @@ from kitchen.staff import (
     StaffSettings,
     to_minutes,
 )
+from kitchen.web.store_errors import StoreError, corrupt_message
 
 SETTINGS_VERSION = 1
+
+
+class SettingsStoreError(StoreError):
+    """Файл настроек повреждён или структурно неверен (AC06)."""
 
 #: Разделитель диапазона времени в настройках: «13:30–14:30».
 RANGE_SEP = "–"
@@ -349,6 +354,26 @@ def day_inputs_to_settings(
     return duty_settings_from(raw), staff_settings_from(raw)
 
 
+def scenario_settings(
+    raw: Mapping[str, Any] | None,
+) -> tuple[DutySettings | None, StaffSettings | None]:
+    """Настройки для расчёта смены одинаково у CLI и веба (AC03).
+
+    Пустой ввод означает «человек ничего не задал»: возвращаются ``None``, и
+    расчёт идёт с обычными настройками и видимой заглушкой состава, а не с
+    нулём сотрудников и пустыми маршрутами. Если состав не задан, но другие
+    поля заполнены, ``staff_settings`` тоже ``None`` — иначе бракераж и
+    численность молча обнулились бы. Оба интерфейса обязаны вызывать эту
+    функцию, чтобы одинаковый ввод давал одинаковый план.
+    """
+    if not raw or not any(raw.get(key) for key in INPUT_KEYS):
+        return None, None
+    duty_settings, staff_settings = day_inputs_to_settings(raw)
+    if not raw.get("staff"):
+        staff_settings = None
+    return duty_settings, staff_settings
+
+
 def settings_form(day: date | None = None) -> tuple[tuple[str, str], ...]:
     """Подсказки формы: (ключ обязанности, что показать пользователю).
 
@@ -498,9 +523,14 @@ def _load_raw(path: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SettingsStoreError(corrupt_message(path, exc)) from exc
+    if not isinstance(data, dict):
+        raise SettingsStoreError(
+            f"файл настроек {path} должен быть словарём JSON, "
+            f"а не {type(data).__name__}"
+        )
+    return data
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -533,7 +563,9 @@ __all__ = [
     "parse_staff_row",
     "save_day_inputs",
     "save_settings",
+    "scenario_settings",
     "settings_form",
+    "SettingsStoreError",
     "staff_settings_from",
     "tasting_executor_of",
 ]

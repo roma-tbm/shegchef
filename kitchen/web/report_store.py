@@ -21,7 +21,13 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
 
+from kitchen.web.store_errors import StoreError, corrupt_message
+
 MARKING_FIELDS: tuple[str, ...] = ("name", "made", "expires")
+
+
+class ReportStoreError(StoreError):
+    """Файл отчётов повреждён или структурно неверен (AC06)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +176,13 @@ def load_report(
 ) -> SaturdayReport | None:
     """Читает сохранённый отчёт; отсутствующий день даёт None, а не ошибку."""
     target = Path(path) if path is not None else default_report_path()
-    raw = _load_raw(target).get("days", {}).get(day.isoformat())
+    payload = _load_raw(target)
+    days = payload.get("days", {})
+    if not isinstance(days, Mapping):
+        raise ReportStoreError(
+            f"файл отчётов {target}: поле «days» должно быть словарём"
+        )
+    raw = days.get(day.isoformat())
     if raw is None:
         return None
     return SaturdayReport(
@@ -204,9 +216,14 @@ def _load_raw(path: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ReportStoreError(corrupt_message(path, exc)) from exc
+    if not isinstance(data, dict):
+        raise ReportStoreError(
+            f"файл отчётов {path} должен быть словарём JSON, "
+            f"а не {type(data).__name__}"
+        )
+    return data
 
 
 def _dump(report: SaturdayReport) -> dict[str, Any]:
@@ -267,5 +284,6 @@ __all__ = [
     "default_report_path",
     "load_report",
     "normalize_report",
+    "ReportStoreError",
     "save_report",
 ]

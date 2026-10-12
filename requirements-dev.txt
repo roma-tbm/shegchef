@@ -1,0 +1,5 @@
+# Тестовые зависимости ShegChef. Устанавливаются поверх requirements.txt.
+# Регрессия запускается одной командой:
+#     python -m pytest tests/ -q
+-r requirements.txt
+pytest>=7.4,<10

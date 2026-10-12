@@ -19,8 +19,13 @@ from datetime import date
 from pathlib import Path
 
 from kitchen.core.planner import STATUSES
+from kitchen.web.store_errors import StoreError, corrupt_message
 
 STORE_VERSION = 1
+
+
+class StatusStoreError(StoreError):
+    """Файл статусов повреждён или структурно неверен (AC06)."""
 
 #: Отдельный файл рядом с меню: ~/.shegchef/statuses.json
 default_status_path = Path.home() / ".shegchef" / "statuses.json"
@@ -85,11 +90,18 @@ def load_statuses(
         return {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        return {}
-    raw_days = payload.get("days", {}) if isinstance(payload, Mapping) else {}
+    except (ValueError, OSError) as exc:
+        raise StatusStoreError(corrupt_message(path, exc)) from exc
+    if not isinstance(payload, Mapping):
+        raise StatusStoreError(
+            f"файл статусов {path} должен быть словарём JSON, "
+            f"а не {type(payload).__name__}"
+        )
+    raw_days = payload.get("days", {})
     if not isinstance(raw_days, Mapping):
-        return {}
+        raise StatusStoreError(
+            f"файл статусов {path}: поле «days» должно быть словарём"
+        )
     out: dict[str, tuple[tuple[str, str], ...]] = {}
     for key, table in raw_days.items():
         try:
@@ -118,4 +130,5 @@ __all__ = [
     "normalize_overrides",
     "overrides_for_day",
     "save_statuses",
+    "StatusStoreError",
 ]

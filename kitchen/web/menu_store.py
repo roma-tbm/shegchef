@@ -21,11 +21,20 @@ from pathlib import Path
 
 from kitchen.menu_week import normalize_weekday
 from kitchen.models import MenuLine, PlanLine
+from kitchen.web.store_errors import StoreError, corrupt_message
 
 STORE_VERSION = 1
 
 #: Где web-интерфейс хранит меню. Локальный файл пользователя, не в репозитории.
 default_store_path = Path.home() / ".shegchef" / "menu.json"
+
+
+class MenuStoreError(StoreError):
+    """Хранилище меню нельзя прочитать или безопасно перезаписать.
+
+    Повреждённый JSON не считается разрешением начать с чистого листа: иначе
+    одна ошибка записи молча стёрла бы сохранённые дни (AC06).
+    """
 
 
 def _iso(day: date) -> str:
@@ -77,6 +86,31 @@ def line_from_dict(raw: Mapping[str, object], day: date, default_meal: str = "О
     return MenuLine(recipe, portions, serve, meal, day, note)
 
 
+def _ensure_writable(path: Path) -> None:
+    """Не даёт перезаписать повреждённое хранилище новыми данными (AC06)."""
+    _read_payload(path)
+
+
+def _read_payload(path: Path) -> dict | None:
+    """JSON хранилища меню или None, если файла нет. Повреждение — ошибка (AC06).
+
+    Структурно неверный JSON (например, список вместо словаря) тоже ошибка:
+    иначе следующее сохранение молча заменило бы чужой файл.
+    """
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise MenuStoreError(corrupt_message(path, exc)) from exc
+    if not isinstance(payload, dict):
+        raise MenuStoreError(
+            f"хранилище меню {path} должно быть словарём JSON, "
+            f"а не {type(payload).__name__}"
+        )
+    return payload
+
+
 def save_days(
     days: Mapping[str, Iterable[MenuLine]],
     path: Path = default_store_path,
@@ -87,6 +121,7 @@ def save_days(
     остаются как были — так разные дни не затирают друг друга.
     """
     path = Path(path)
+    _ensure_writable(path)
     merged = dict(load_days(path))
     for key, lines in days.items():
         merged[key] = tuple(lines)
@@ -112,18 +147,19 @@ def load_days(path: Path = default_store_path) -> dict[str, tuple[MenuLine, ...]
     Дата, которая есть в файле, всегда присутствует в результате — даже если
     строк в ней не осталось (пустой кортеж). Так «сознательно очищенное меню»
     отличается от даты, которой в файле нет вовсе. Некорректные строки внутри
-    даты пропускаются, но сама дата остаётся. Отсутствующий или битый файл —
-    пустой словарь.
+    даты пропускаются, но сама дата остаётся. Отсутствующий файл — пустой
+    словарь; повреждённый или структурно неверный — понятная ошибка (AC06).
     """
     path = Path(path)
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
+    payload = _read_payload(path)
+    if payload is None:
         return {}
     out: dict[str, tuple[MenuLine, ...]] = {}
-    raw_days = payload.get("days", {}) if isinstance(payload, dict) else {}
+    raw_days = payload.get("days", {})
+    if not isinstance(raw_days, Mapping):
+        raise MenuStoreError(
+            f"хранилище меню {path}: поле «days» должно быть словарём"
+        )
     for key, lines in raw_days.items():
         try:
             day = date.fromisoformat(str(key))
@@ -175,6 +211,7 @@ __all__ = [
     "line_from_dict",
     "line_to_dict",
     "load_days",
+    "MenuStoreError",
     "parse_serve_at",
     "plan_to_menu",
     "save_days",

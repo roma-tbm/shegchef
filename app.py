@@ -50,19 +50,22 @@ from kitchen.web.catalog import (
     search_recipes,
 )
 from kitchen.web.menu_store import (
-    load_days,
+    MenuStoreError,
     parse_serve_at,
     plan_to_menu,
     save_days,
 )
 from kitchen.web.messages import all_messages_text, messages_by_role
+from kitchen.web.dataset import Dataset
 from kitchen.web.report_store import SaturdayReport, SemifinishedMarking, SemifinishedOutput
 from kitchen.web.scaling import ScaleError, scaled_preview, validate_factor
+from kitchen.web.store_errors import StoreError
 from kitchen.web.settings_store import (
     duty_settings_from,
     load_day_inputs,
     save_day_inputs,
     save_settings,
+    scenario_settings,
     staff_settings_from,
 )
 from kitchen.web.shift_plan import (
@@ -210,31 +213,66 @@ def compute_sheet(
 
 
 def persist_store() -> None:
-    """Сохраняет текущее меню дня в локальный JSON."""
-    save_days(
-        {st.session_state.day.isoformat(): tuple(sort_menu(st.session_state.menu))},
-        st.session_state.store,
-    )
+    """Сохраняет текущее меню дня в выбранный источник, а не всегда в menu.json.
+
+    Источник выбирает ``Dataset.menu_write_targets``: явный файл
+    (``SHEGCHEF_MENU_FILE``) или файл, откуда запись дня была прочитана
+    (``menu.json`` / ``меню.json``). Иначе правка даты из ``меню.json`` создала
+    бы вторую запись в ``menu.json`` и конфликт двух имён (R7).
+
+    Повреждённое хранилище не перезаписывается: человек видит ошибку, а
+    сохранённые ранее дни остаются на месте (AC06).
+    """
+    day_key = st.session_state.day.isoformat()
+    payload = {day_key: tuple(sort_menu(st.session_state.menu))}
+    try:
+        for target in dataset().menu_write_targets(day_key):
+            save_days(payload, target)
+    except MenuStoreError as exc:
+        st.error(f"Меню не сохранено: {exc}")
 
 
 def status_path() -> Path:
-    """Файл статусов рядом с меню пользователя."""
-    return status_store.default_status_path_for(st.session_state.store)
+    """Файл статусов выбранного набора данных."""
+    return dataset().statuses
 
 
 def settings_path() -> Path:
-    """Файл настроек смены рядом с меню пользователя."""
-    return settings_store.default_settings_path(st.session_state.store)
+    """Файл настроек смены выбранного набора данных."""
+    return dataset().settings
 
 
 def notes_path() -> Path:
-    """Файл отклонений и комментариев рядом с меню пользователя."""
-    return deviation_store.default_notes_path(st.session_state.store)
+    """Файл отклонений и комментариев выбранного набора данных."""
+    return dataset().notes
 
 
 def report_path() -> Path:
-    """Файл отчётов рядом с меню пользователя."""
-    return report_store.default_report_path(st.session_state.store)
+    """Файл отчётов выбранного набора данных."""
+    return dataset().reports
+
+
+def dataset() -> Dataset:
+    """Набор данных, выбранный конфигурацией запуска.
+
+    Каталог берётся из ``SHEGCHEF_DATA_DIR`` (по умолчанию ``~/.shegchef``) —
+    то же определение, что у CLI. Специальный UI не нужен: обычный запуск
+    Streamlit использует эту же конфигурацию.
+    """
+    return Dataset.default()
+
+
+def menu_days() -> dict[str, tuple[MenuLine, ...]]:
+    """Сохранённые меню выбранного набора данных с понятной ошибкой (AC06).
+
+    Конфликт двух имён меню или повреждённый файл не роняют приложение и не
+    позволяют перезаписать данные: ошибка сохраняется в сессии и показывается.
+    """
+    try:
+        return dataset().load_menu_days()
+    except StoreError as exc:
+        st.session_state.data_error = str(exc)
+        return {}
 
 
 def saved_report() -> SaturdayReport | None:
@@ -265,7 +303,7 @@ def stored_menu(day: date) -> list[MenuLine]:
     подставляется: воскресный расчёт должен видеть пустое меню, если
     понедельник не заполнен, а не чужие блюда.
     """
-    return list(load_days(st.session_state.store).get(day.isoformat(), ()))
+    return list(menu_days().get(day.isoformat(), ()))
 
 
 def next_day_menu_for(day: date) -> tuple[MenuLine, ...]:
@@ -282,13 +320,14 @@ def compute_plan(menu: list[MenuLine]):
     notes = deviation_store.load_day_notes(st.session_state.day, notes_path())
     deviations = deviation_store.load_deviations(st.session_state.day, notes_path())
     settings: dict = day_inputs() if has_saved_settings() else {}
+    duty_settings, staff_settings = scenario_settings(settings)
     scenario = build_scenario(
         data_for(menu),
         st.session_state.day,
         menu=tuple(menu),
         next_menu=next_day_menu_for(st.session_state.day),
-        duty_settings=duty_settings_from(settings) if settings else None,
-        staff_settings=staff_settings_from(settings) if settings else None,
+        duty_settings=duty_settings,
+        staff_settings=staff_settings,
         overrides=status_store.overrides_for_day(st.session_state.day, status_path()),
         notes=tuple(sorted(notes.items())),
         deviations=tuple(
@@ -303,10 +342,14 @@ def compute_plan(menu: list[MenuLine]):
 
 def save_status(item_id: str, status: str) -> None:
     """Запоминает отметку человека по конкретной работе."""
-    status_store.save_statuses(
-        {st.session_state.day.isoformat(): ((item_id, status),)},
-        status_path(),
-    )
+    try:
+        status_store.save_statuses(
+            {st.session_state.day.isoformat(): ((item_id, status),)},
+            status_path(),
+        )
+    except (StoreError, OSError) as exc:
+        st.error(f"Отметка не сохранена: {exc}")
+        return
     invalidate_plan()
 
 
@@ -322,7 +365,7 @@ def bootstrap() -> None:
     today = date.today()
     st.session_state.day = today
     st.session_state.weekday = weekday_of(today)
-    st.session_state.store = menu_store.default_store_path
+    st.session_state.data_error = None
     st.session_state.menu_seed = 0
     st.session_state.preview = None
     st.session_state.scale_factor = 1.0
@@ -335,7 +378,7 @@ def bootstrap() -> None:
     # Дата, сохранённая в JSON (даже пустая), берётся из него; без записи —
     # разворот плана для буднего дня и пустое меню для выходного.
     st.session_state.menu, st.session_state.menu_source = menu_for_day(
-        today, load_days(st.session_state.store)
+        today, menu_days()
     )
     st.session_state.booted = True
 
@@ -373,7 +416,7 @@ def on_day_changed() -> None:
         st.session_state._weekday = WEEKDAYS[0]
     _reset_day_widgets()
     st.session_state.menu, st.session_state.menu_source = menu_for_day(
-        new_day, load_days(st.session_state.store)
+        new_day, menu_days()
     )
     st.session_state.preview = None
     st.session_state.menu_seed += 1
@@ -969,9 +1012,13 @@ def render_settings_tab() -> None:
         except ValueError as exc:
             st.error(f"Настройки не сохранены: {exc}")
             return
-        save_day_inputs(day, payload, settings_path())
-        if apply_to_all:
-            save_settings(payload, settings_path())
+        try:
+            save_day_inputs(day, payload, settings_path())
+            if apply_to_all:
+                save_settings(payload, settings_path())
+        except (StoreError, OSError) as exc:
+            st.error(f"Настройки не сохранены: {exc}")
+            return
         invalidate_plan()
         st.rerun()
 
@@ -1099,9 +1146,13 @@ def _save_notes(edited: pd.DataFrame) -> None:
         }
         for _, row in edited.iterrows()
     ]
-    saved, problems = deviation_store.save_from_rows(
-        st.session_state.day, rows, notes_path()
-    )
+    try:
+        saved, problems = deviation_store.save_from_rows(
+            st.session_state.day, rows, notes_path()
+        )
+    except (StoreError, OSError) as exc:
+        st.error(f"Комментарии не сохранены: {exc}")
+        return
     if problems:
         st.error(
             "Не сохранено. Для отклонения укажите пояснение (и минуты, если это "
@@ -1213,7 +1264,11 @@ def render_report_tab() -> None:
                 "дата производства или срок годности — " + ", ".join(missing)
             )
             return
-        report_store.save_report(day, report, report_path())
+        try:
+            report_store.save_report(day, report, report_path())
+        except (StoreError, OSError) as exc:
+            st.error(f"Отчёт не сохранён: {exc}")
+            return
         st.success("Отчёт сохранён локально.")
         st.code(
             saturday_report_form(
@@ -1363,6 +1418,10 @@ def main() -> None:
 
     bootstrap()
 
+    if st.session_state.get("data_error"):
+        st.error(f"Данные не загружены: {st.session_state.data_error}")
+        st.stop()
+
     with st.sidebar:
         st.subheader("Смена")
         st.date_input(
@@ -1404,24 +1463,28 @@ def main() -> None:
         tab_notes,
         tab_report,
     ) = st.tabs(TABS)
-    with tab_menu:
-        render_menu_tab()
-    with tab_calc:
-        render_calc_tab()
-    with tab_products:
-        render_products_tab()
-    with tab_tasks:
-        render_tasks_tab()
-    with tab_routes:
-        render_routes_tab()
-    with tab_export:
-        render_export_tab()
-    with tab_settings:
-        render_settings_tab()
-    with tab_notes:
-        render_notes_tab()
-    with tab_report:
-        render_report_tab()
+    try:
+        with tab_menu:
+            render_menu_tab()
+        with tab_calc:
+            render_calc_tab()
+        with tab_products:
+            render_products_tab()
+        with tab_tasks:
+            render_tasks_tab()
+        with tab_routes:
+            render_routes_tab()
+        with tab_export:
+            render_export_tab()
+        with tab_settings:
+            render_settings_tab()
+        with tab_notes:
+            render_notes_tab()
+        with tab_report:
+            render_report_tab()
+    except StoreError as exc:
+        st.error(f"Данные не загружены: {exc}")
+        st.stop()
 
 
 if __name__ == "__main__":

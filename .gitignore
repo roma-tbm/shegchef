@@ -11,16 +11,10 @@ __pycache__/
 .DS_Store
 
 # Локальные материалы разработки
-/AGENTS.md
-/TASK.md
-/QA_TASK.md
-/IMPLEMENTATION_REPORT.md
-/QA_REPORT.md
 /stage3.md
 /summary.md
 /startconcept/
 /tasks/
-/tests/
 /.agents/
 /.codex/
 /.idea/

@@ -35,6 +35,9 @@ from kitchen.menu_week import WEEKDAYS, WEEK_PLAN, normalize_weekday
 from kitchen.models import KitchenData, MenuLine, PlanLine
 from kitchen.seed import demo_data
 from kitchen.web import deviation_store, menu_store, report_store, settings_store
+from kitchen.web import status_store
+from kitchen.web.dataset import Dataset
+from kitchen.web.store_errors import StoreError
 from kitchen.web.report_store import SaturdayReport
 from kitchen.web.scaling import ScaleError, scale_menu
 from kitchen.web.shift_plan import (
@@ -131,20 +134,45 @@ def _rebuilt(
 def _from_menu(
     data: KitchenData, args: argparse.Namespace, day: date
 ) -> tuple[KitchenData, str]:
-    """Меню из книги, если шеф его правил, иначе из --menu или демо-набора."""
-    if not args.fresh and args.out.exists():
+    """Меню дня по общей политике D3; книга — только при явном выборе.
+
+    Приоритет: явные ключи (`--menu`, `--fresh`), затем явный Excel-источник
+    (`--from-book`) или явный JSON (`--menu-file`), затем сохранённая запись
+    даты в общем каталоге данных и, наконец, автоматическая заготовка.
+
+    Наличие выходной книги само по себе меню не выбирает: иначе при смене
+    даты старое меню книги переносилось бы на новый день и перебивало явно
+    выбранный JSON (R4).
+    """
+    if args.menu:
+        menu = tuple(
+            MenuLine(l.recipe, args.menu, l.serve_at, l.meal, day) for l in data.menu
+        )
+        return _rebuilt(data, menu), f"{args.menu} порций"
+    if args.fresh:
+        return data, "демо-меню"
+    if args.from_book and args.out.exists():
         rows = read_menu(args.out, _known_recipes())
         if rows:
             menu = tuple(
                 MenuLine(r.recipe, r.portions, r.serve_at, r.meal, day) for r in rows
             )
             return _rebuilt(data, menu), f"из файла {args.out.name}"
-    if args.menu:
-        menu = tuple(
-            MenuLine(l.recipe, args.menu, l.serve_at, l.meal, day) for l in data.menu
-        )
-        return _rebuilt(data, menu), f"{args.menu} порций"
-    return data, "демо-меню"
+
+    days = _dataset_of(args).load_menu_days(only=args.menu_file)
+    key = day.isoformat()
+    if key in days:
+        return _rebuilt(data, days[key]), f"сохранённое меню за {day:%d.%m.%Y}"
+    if day.weekday() < len(WEEKDAYS):
+        wd = WEEKDAYS[day.weekday()]
+        return _rebuilt(data, menu_store.plan_to_menu(WEEK_PLAN, wd, day)), f"план «{wd}»"
+    return _rebuilt(data, ()), "пустое меню: выходной"
+
+
+def _dataset_of(args: argparse.Namespace) -> Dataset:
+    """Набор данных из аргументов CLI: явный каталог или общий по умолчанию."""
+    dataset = getattr(args, "dataset", None)
+    return dataset if dataset is not None else Dataset.default()
 
 
 def _with_week_plan(
@@ -220,14 +248,16 @@ def _with_search(
 
 
 def _resolve_settings(args) -> Path | None:
-    """Путь файла настроек: заданный пользователем или тот, что рядом с меню.
+    """Путь файла настроек: заданный пользователем или в наборе данных.
 
     Настройки добровольны: их нет — расчёт идёт с видимыми пропусками по
-    длительностям, а не с выдуманными нормами.
+    длительностям, а не с выдуманными нормами. По умолчанию файл лежит в общем
+    каталоге данных (``~/.shegchef``), а не рядом с книгой: смена выходного
+    пути книги не должна менять набор настроек.
     """
     if args.settings:
         return args.settings
-    candidate = settings_store.default_settings_path(args.out)
+    candidate = _dataset_of(args).settings
     return candidate if candidate.exists() else None
 
 
@@ -235,46 +265,59 @@ def _resolve_notes(args) -> Path | None:
     """Путь файла комментариев и отклонений, если он уже есть."""
     if args.notes:
         return args.notes
-    candidate = deviation_store.default_notes_path(args.out)
+    candidate = _dataset_of(args).notes
     return candidate if candidate.exists() else None
 
 
-def _stored_menu(day: date, out: Path) -> tuple[MenuLine, ...]:
-    """Меню даты из пользовательского JSON-хранилища рядом с книгой.
+def _resolve_statuses(args) -> Path:
+    """Путь файла статусов: явный или в наборе данных."""
+    if args.statuses:
+        return args.statuses
+    return _dataset_of(args).statuses
 
-    Хранилище одно и то же для интерфейса и CLI: иначе воскресный расчёт на
-    бумаге опирался бы на другой источник, чем на экране (AC10, AC11).
+
+def _resolve_reports(args) -> Path:
+    """Путь файла субботних отчётов: явный или в наборе данных."""
+    if args.reports:
+        return args.reports
+    return _dataset_of(args).reports
+
+
+def _stored_menu(day: date, path: Path) -> tuple[MenuLine, ...]:
+    """Меню даты из конкретного файла меню.
+
+    Используется точками входа, которым файл задан явно (``--menu-file`` и
+    проверки сквозного сценария): тогда конфликт с другим хранилищем не
+    проверяется, потому что источник назвал сам человек.
     """
-    path = Path(out).with_name("меню.json")
-    if not path.exists():
+    if not Path(path).exists():
         return ()
     return tuple(menu_store.load_days(path).get(day.isoformat(), ()))
 
 
-def _next_day_menu(data: KitchenData, day: date, out: Path) -> tuple[MenuLine, ...]:
+def _next_day_menu(
+    data: KitchenData,
+    day: date,
+    out: Path,
+    *,
+    dataset: Dataset | None = None,
+    menu_file: Path | None = None,
+) -> tuple[MenuLine, ...]:
     """Меню дня, к которому готовит смена `day`.
 
-    Источники по приоритету: сохранённое меню пользователя, лист «План меню»
-    книги (его тоже правят руками) и только потом — строки, которые уже лежат
-    в данных. Подменять день нельзя: отсутствие меню остаётся причиной,
-    которую печатает планировщик (AC11, AC15).
+    Источник один и тот же у CLI и веба: сохранённая запись целевой даты в
+    общем каталоге данных. Если записи нет, меню считается отсутствующим —
+    та же видимая причина неготовности, что и на экране. Заготовка выходной
+    книги сюда намеренно не подставляется (R2): иначе воскресная подготовка
+    разошлась бы между CLI и вебом. Сохранённая пустая запись остаётся пустой
+    и не подменяется данными (AC06).
     """
     target = prep_target_day(day)
-    stored = _stored_menu(target, out)
-    if stored:
-        return stored
-    if Path(out).exists():
-        try:
-            plan = read_plan(out, _known_recipes())
-        except Exception:  # noqa: BLE001 - книга может быть не нашей
-            plan = ()
-        if plan and target.weekday() < len(WEEKDAYS):
-            rows = plan_for(plan, normalize_weekday(WEEKDAYS[target.weekday()]) or "")
-            if rows:
-                return tuple(
-                    MenuLine(r.recipe, r.portions, r.serve_at, r.meal, target)
-                    for r in rows
-                )
+    ds = dataset or Dataset.default()
+    days = ds.load_menu_days(only=menu_file) if menu_file else ds.load_menu_days()
+    key = target.isoformat()
+    if key in days:
+        return days[key]
     return tuple(line for line in data.menu if line.day == target and line.portions > 0)
 
 
@@ -284,41 +327,48 @@ def _scenario_with_settings(
     settings_file: Path | None,
     notes_file: Path | None,
     *,
-    next_menu: tuple[MenuLine, ...] = (),
+    statuses_file: Path | None = None,
+    next_menu: tuple[MenuLine, ...] | None = None,
     out: Path | None = None,
+    dataset: Dataset | None = None,
+    menu_file: Path | None = None,
 ) -> ShiftScenario:
-    """Сценарий смены с настройками и записями человека.
+    """Сценарий смены с настройками, статусами и записями человека.
 
-    CLI и интерфейс читают одни и те же файлы, поэтому расчёт на бумаге и на
-    экране не может разойтись из-за разных источников настроек.
+    CLI и интерфейс читают одни и те же файлы (общий каталог данных), поэтому
+    расчёт на бумаге и на экране не может разойтись из-за разных источников
+    настроек. Статусы передаются в расчёт наравне с интерфейсом: отметка
+    «сделано» должна переживать экспорт из CLI (AC03).
     """
     notes, deviations = _stored_records(day, notes_file)
-    next_menu = next_menu or _next_day_menu(data, day, out or Path(DEFAULT_OUT))
+    if next_menu is None:
+        next_menu = _next_day_menu(
+            data, day, out or Path(DEFAULT_OUT), dataset=dataset, menu_file=menu_file
+        )
+    overrides = (
+        tuple(status_store.overrides_for_day(day, statuses_file))
+        if statuses_file is not None
+        else ()
+    )
+    records = {
+        "next_menu": next_menu,
+        "overrides": overrides,
+        "notes": notes,
+        "deviations": deviations,
+    }
     if not settings_file:
         # Настроек нет: расчёт идёт с обычными настройками, а не с пустым
         # составом — иначе CLI тихо печатал бы пустые маршруты. Записи
         # человека при этом сохраняются: они не часть настроек.
-        return build_scenario(
-            data, day, next_menu=next_menu, notes=notes, deviations=deviations
-        )
+        return build_scenario(data, day, **records)
     raw = settings_store.load_day_inputs(day, settings_file)
-    if not any(raw.get(key) for key in settings_store.INPUT_KEYS):
-        return build_scenario(
-            data, day, next_menu=next_menu, notes=notes, deviations=deviations
-        )
-    duty_settings, staff_settings = settings_store.day_inputs_to_settings(raw)
-    if not raw.get("staff"):
-        # Состав пользователь не задавал: остаётся видимая заглушка счёта
-        # поваров, а не ноль сотрудников в маршрутах.
-        staff_settings = None
+    duty_settings, staff_settings = settings_store.scenario_settings(raw)
     return build_scenario(
         data,
         day,
-        next_menu=next_menu,
         duty_settings=duty_settings,
         staff_settings=staff_settings,
-        notes=notes,
-        deviations=deviations,
+        **records,
     )
 
 
@@ -428,7 +478,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="день недели из «Плана меню»: пн…пт, полное "
                              "название или 1…5")
     parser.add_argument("--fresh", action="store_true",
-                        help="игнорировать существующий файл, взять демо-меню")
+                        help="игнорировать сохранённую запись: взять демо-меню, "
+                             "а с --week — план из кода")
+    parser.add_argument("--from-book", action="store_true",
+                        help="взять меню из книги --out как явный Excel-источник. "
+                             "Без этого ключа книга сама меню не выбирает")
     parser.add_argument("--search", nargs="?", const="", default=None, metavar="ЗАПРОС",
                         help="подставить блюда из ТТК в пустые строки окон "
                              "«Конструктора меню». Без значения берётся запрос из "
@@ -439,12 +493,26 @@ def main(argv: list[str] | None = None) -> int:
                              "расчётом смены; округление порций до целых, минимум 1")
     parser.add_argument("--settings", type=Path, default=None,
                         help="файл настроек смены (по умолчанию settings.json "
-                             "рядом с меню). Там длительности, окна, состав и "
-                             "исполнитель бракеража — те же данные, что вводятся "
-                             "во вкладке «Настройки смены»")
+                             "в каталоге данных ~/.shegchef). Там длительности, "
+                             "окна, состав и исполнитель бракеража — те же данные, "
+                             "что вводятся во вкладке «Настройки смены»")
     parser.add_argument("--notes", type=Path, default=None,
                         help="файл комментариев и отклонений (по умолчанию "
-                             "notes.json рядом с меню)")
+                             "notes.json в каталоге данных)")
+    parser.add_argument("--statuses", type=Path, default=None,
+                        help="файл статусов работ (по умолчанию statuses.json "
+                             "в каталоге данных). CLI передаёт их в расчёт так же, "
+                             "как интерфейс, — отметка «сделано» не теряется")
+    parser.add_argument("--reports", type=Path, default=None,
+                        help="файл субботних отчётов (по умолчанию reports.json "
+                             "в каталоге данных)")
+    parser.add_argument("--data-dir", type=Path, default=None,
+                        help="общий каталог данных: menu.json, settings.json, "
+                             "notes.json, statuses.json, reports.json. По умолчанию "
+                             "~/.shegchef или переменная SHEGCHEF_DATA_DIR")
+    parser.add_argument("--menu-file", type=Path, default=None, metavar="МЕНЮ.JSON",
+                        help="явный файл меню-хранилища; вместо menu.json и "
+                             "меню.json берётся только он (разрешает конфликт дат)")
     parser.add_argument("--print-dir", type=Path, default=None,
                         help="папка для печатных форм (по умолчанию «"
                              + PRINT_DIR_NAME + "» рядом с книгой)")
@@ -453,6 +521,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-open", action="store_true",
                         help="не открывать результат")
     args = parser.parse_args(argv)
+    args.dataset = (
+        Dataset.in_dir(args.data_dir) if args.data_dir else Dataset.default()
+    )
 
     day = (
         datetime.strptime(args.day, "%d.%m.%Y").date() if args.day else date.today()
@@ -480,7 +551,11 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 2
     else:
-        data, source = _from_menu(data, args, day)
+        try:
+            data, source = _from_menu(data, args, day)
+        except StoreError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     if args.search is not None:
         data, source, report = _with_search(data, args, day)
@@ -502,10 +577,21 @@ def main(argv: list[str] | None = None) -> int:
 
     settings_file = _resolve_settings(args)
     notes_file = _resolve_notes(args)
+    statuses_file = _resolve_statuses(args)
     try:
         scenario = _scenario_with_settings(
-            data, day, settings_file, notes_file, out=args.out
+            data,
+            day,
+            settings_file,
+            notes_file,
+            statuses_file=statuses_file,
+            out=args.out,
+            dataset=args.dataset,
+            menu_file=args.menu_file,
         )
+    except StoreError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(f"Настройки смены не разобраны: {exc}", file=sys.stderr)
         return 2
@@ -552,7 +638,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.no_print:
         print_dir = args.print_dir or args.out.parent / PRINT_DIR_NAME
-        saved_report = _saved_report_for(day, args.out.parent)
+        try:
+            saved_report = report_store.load_report(day, _resolve_reports(args))
+        except StoreError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         try:
             forms = _printout_files(scenario, print_dir, report=saved_report)
         except OSError as exc:
